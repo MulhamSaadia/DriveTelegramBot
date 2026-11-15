@@ -18,7 +18,7 @@ Flow:
   - admin: /admin (users, ban/unban, approval mode), /ban <id>, /unban <id>
 Telegram bot download limit: 20MB per file.
 """
-import io, os, re, json, datetime, mimetypes
+import io, os, re, json, datetime, mimetypes, traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from telegram import (
@@ -39,12 +39,13 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 DEFAULT_FOLDER = os.environ.get("FOLDER_NAME", "Telegram Uploads")
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 STATUS_BTN = "📊 الحالة"
+MAX_BYTES = 20 * 1024 * 1024  # Telegram Bot API download limit
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 
 
 # ---------- database (Supabase Postgres, schema "drivebot") ----------
 def q(sql, args=(), fetch=None):
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
     try:
         with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, args)
@@ -219,6 +220,10 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if isinstance(att, (list, tuple)):  # photo -> biggest size
         att = att[-1]
     if not hasattr(att, "file_id"):
+        return
+    size = getattr(att, "file_size", None)
+    if size and size > MAX_BYTES:
+        await m.reply_text(f"❌ الملف كبير ({size / 1024 / 1024:.0f}MB). حد تلغرام للبوتات 20MB.")
         return
 
     mime = getattr(att, "mime_type", None)
@@ -429,10 +434,30 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cq.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
 
 
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Log every handler error; show details to admins, generic message to users."""
+    err = ctx.error
+    traceback.print_exception(type(err), err, err.__traceback__)
+    detail = f"❌ {type(err).__name__}: {err}"[:600]
+    chat_id = update.effective_chat.id if isinstance(update, Update) and update.effective_chat else None
+    targets = set(ADMIN_IDS)
+    if chat_id and chat_id not in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(chat_id, "❌ صار خطأ، جرّب مرة ثانية.")
+        except Exception:
+            pass
+    for t in targets:
+        try:
+            await ctx.bot.send_message(t, detail)
+        except Exception:
+            pass
+
+
 if not ADMIN_IDS:
     print("WARNING: ADMIN_IDS not set -> no admin panel. Get your ID from @userinfobot")
 
 app = ApplicationBuilder().token(BOT_TOKEN).build()
+app.add_error_handler(on_error)
 app.add_handler(TypeHandler(Update, gate), group=-1)
 app.add_handler(CommandHandler("admin", admin))
 app.add_handler(CommandHandler("ban", ban))
