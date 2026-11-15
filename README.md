@@ -40,4 +40,10 @@ Telegram's cloud Bot API limits bot downloads to 20MB. To go up to 2GB, run a lo
 4. Start the bot with `BOT_API_URL=http://localhost:8081`
 
 Without `BOT_API_URL` the limit is 20MB per file.
+
+### Server deploy (no local server, files never pass through your own connection)
+The included `Dockerfile` runs the local Bot API server + the bot in one container (`start.sh`).
+Deploy it on any Docker host (Railway, Fly.io, a VM...) with these variables:
+`BOT_TOKEN`, `ADMIN_IDS`, `DATABASE_URL`, `GOOGLE_TOKEN_JSON`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`.
+Log the bot out of the cloud API once before first start (see step 2 above).
 Never commit `token.json` / `credentials.json` / tokens (see `.gitignore`).
