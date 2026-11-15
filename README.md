@@ -30,5 +30,14 @@ Set `ADMIN_IDS` (comma-separated Telegram IDs, get yours from @userinfobot).
 | `DATABASE_URL` | Supabase pooler URI |
 | `GOOGLE_TOKEN_JSON` | full contents of `token.json` |
 
-Telegram bot download limit: 20MB per file.
+## Big files (> 20MB)
+Telegram's cloud Bot API limits bot downloads to 20MB. To go up to 2GB, run a local Bot API server and point the bot at it:
+1. Get `api_id` / `api_hash` at my.telegram.org
+2. Log the bot out of the cloud API once: `https://api.telegram.org/bot<TOKEN>/logOut`
+3. Run the server on the same machine as the bot:
+   `telegram-bot-api --api-id=ID --api-hash=HASH --local --dir=$HOME/tgapi --http-port=8081`
+   (NixOS: `nix-shell -p telegram-bot-api`; Docker: `aiogram/telegram-bot-api`)
+4. Start the bot with `BOT_API_URL=http://localhost:8081`
+
+Without `BOT_API_URL` the limit is 20MB per file.
 Never commit `token.json` / `credentials.json` / tokens (see `.gitignore`).

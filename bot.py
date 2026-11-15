@@ -6,6 +6,7 @@ Env vars:
   DATABASE_URL       Postgres connection string (Supabase pooler URI)
   GOOGLE_TOKEN_JSON  contents of token.json (authorized-user JSON w/ refresh token)
   FOLDER_NAME        optional, default "Telegram Uploads"
+  BOT_API_URL        optional, self-hosted Bot API server URL (e.g. http://localhost:8081) -> files up to 2GB
 
 Local first run (to create token.json): put credentials.json next to bot.py and run;
 a browser opens for Google login. Then paste token.json contents into GOOGLE_TOKEN_JSON on the server.
@@ -16,9 +17,9 @@ Flow:
   - status: /status or "📊 الحالة" button
   - /newfolder <name>, /folder
   - admin: /admin (users, ban/unban, approval mode), /ban <id>, /unban <id>
-Telegram bot download limit: 20MB per file.
+Download limit: 20MB (cloud Bot API) or 2GB with BOT_API_URL (local Bot API server).
 """
-import io, os, re, json, datetime, mimetypes, traceback
+import asyncio, os, re, json, datetime, mimetypes, tempfile, traceback
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from telegram import (
@@ -32,14 +33,18 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 DEFAULT_FOLDER = os.environ.get("FOLDER_NAME", "Telegram Uploads")
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 STATUS_BTN = "📊 الحالة"
-MAX_BYTES = 20 * 1024 * 1024  # Telegram Bot API download limit
+# Optional: URL of a self-hosted Telegram Bot API server (run with --local) -> files up to 2GB.
+# Without it, Telegram's cloud Bot API limits downloads to 20MB.
+BOT_API_URL = os.environ.get("BOT_API_URL", "").rstrip("/")
+MAX_BYTES = (2000 if BOT_API_URL else 20) * 1024 * 1024
+DRIVE_LOCK = asyncio.Lock()
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 
 
@@ -178,14 +183,26 @@ async def ask_next(ctx, chat_id, ud):
 # ---------- upload ----------
 async def upload_item(ctx, chat_id, ud, item, chosen_name):
     tg_file = await ctx.bot.get_file(item["file_id"])
-    buf = io.BytesIO()
-    await tg_file.download_to_memory(buf)
-    buf.seek(0)
     name = with_ext(chosen_name, item["ext"]) if chosen_name else item["default_name"]
-    media = MediaIoBaseUpload(buf, mimetype=item["mime"], resumable=True)
-    r = drive.files().create(
-        body={"name": name, "parents": [folder_id()]}, media_body=media, fields="id"
-    ).execute()
+    parent = await asyncio.to_thread(folder_id)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=item["ext"] or ".bin")
+    tmp.close()
+    try:
+        await tg_file.download_to_drive(tmp.name)  # to disk, not RAM (works for big files)
+        media = MediaFileUpload(tmp.name, mimetype=item["mime"], resumable=True, chunksize=8 * 1024 * 1024)
+
+        def _create():
+            return drive.files().create(
+                body={"name": name, "parents": [parent]}, media_body=media, fields="id"
+            ).execute()
+
+        async with DRIVE_LOCK:
+            r = await asyncio.to_thread(_create)
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
     ud.setdefault("uploaded", []).append({"id": r["id"], "name": name})
     inc_uploads(item["uid"])
     await ctx.bot.send_message(chat_id, f"✅ انرفع: {name}", reply_markup=kb_after_upload(r["id"]))
@@ -223,7 +240,9 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     size = getattr(att, "file_size", None)
     if size and size > MAX_BYTES:
-        await m.reply_text(f"❌ الملف كبير ({size / 1024 / 1024:.0f}MB). حد تلغرام للبوتات 20MB.")
+        await m.reply_text(
+            f"❌ الملف كبير ({size / 1024 / 1024:.0f}MB). الحد الحالي {MAX_BYTES // 1024 // 1024}MB."
+        )
         return
 
     mime = getattr(att, "mime_type", None)
@@ -456,7 +475,10 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
 if not ADMIN_IDS:
     print("WARNING: ADMIN_IDS not set -> no admin panel. Get your ID from @userinfobot")
 
-app = ApplicationBuilder().token(BOT_TOKEN).build()
+builder = ApplicationBuilder().token(BOT_TOKEN)
+if BOT_API_URL:
+    builder = builder.base_url(f"{BOT_API_URL}/bot").base_file_url(f"{BOT_API_URL}/file/bot").local_mode(True)
+app = builder.build()
 app.add_error_handler(on_error)
 app.add_handler(TypeHandler(Update, gate), group=-1)
 app.add_handler(CommandHandler("admin", admin))
