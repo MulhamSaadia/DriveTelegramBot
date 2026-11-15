@@ -13,13 +13,13 @@ Flow:
   - /newfolder <name> creates + switches folder, /folder shows link
 Telegram bot download limit: 20MB per file.
 """
-import io, os, re, datetime, mimetypes
+import io, os, re, json, datetime, mimetypes
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
 )
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
-    ContextTypes, filters,
+    TypeHandler, ApplicationHandlerStop, ContextTypes, filters,
 )
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -32,6 +32,33 @@ DEFAULT_FOLDER = os.environ.get("FOLDER_NAME", "Telegram Uploads")
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 ID_FILE = "folder_id.txt"
 STATUS_BTN = "📊 الحالة"
+USERS_FILE = "users.json"
+# comma-separated Telegram user IDs of admins (get yours from @userinfobot)
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+
+
+# ---------- users / access control ----------
+def load_db():
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {"users": {}, "approval_mode": False}
+
+
+DB = load_db()
+
+
+def save_db():
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(DB, f, ensure_ascii=False, indent=1)
+
+
+def now():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def label(rec):
+    return f"@{rec['username']}" if rec.get("username") else rec["name"]
 
 
 # ---------- Drive ----------
@@ -128,6 +155,10 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
         body={"name": name, "parents": [folder_id()]}, media_body=media, fields="id"
     ).execute()
     ud.setdefault("uploaded", []).append({"id": r["id"], "name": name})
+    rec = DB["users"].get(str(item.get("uid")))
+    if rec:
+        rec["uploads"] = rec.get("uploads", 0) + 1
+        save_db()
     await ctx.bot.send_message(chat_id, f"✅ انرفع: {name}", reply_markup=kb_after_upload(r["id"]))
 
 
@@ -180,6 +211,7 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     base = os.path.splitext(orig)[0] if orig else "file"
     item = {
         "file_id": att.file_id,
+        "uid": u.id,
         "mime": mime,
         "ext": ext,
         "label": orig or f"{kind} {m.message_id}",
@@ -239,6 +271,143 @@ async def skipall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await upload_item(ctx, update.message.chat_id, ud, q.pop(0), None)
 
 
+# ---------- access gate + admin panel ----------
+def is_admin(update):
+    return update.effective_user and update.effective_user.id in ADMIN_IDS
+
+
+def user_buttons(rec):
+    uid, st = rec["id"], rec["status"]
+    if st == "banned":
+        return InlineKeyboardButton(f"♻️ فك حظر {label(rec)}", callback_data=f"adm:set:{uid}:active")
+    if st == "pending":
+        return InlineKeyboardButton(f"✅ قبول {label(rec)}", callback_data=f"adm:set:{uid}:active")
+    return InlineKeyboardButton(f"🚫 حظر {label(rec)}", callback_data=f"adm:set:{uid}:banned")
+
+
+async def gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs before every handler: records users, blocks banned / unapproved."""
+    u = update.effective_user
+    if not u or u.id in ADMIN_IDS:
+        return
+    rec = DB["users"].get(str(u.id))
+    new = rec is None
+    if new:
+        rec = {
+            "id": u.id, "name": u.full_name, "username": u.username,
+            "first_seen": now(), "uploads": 0,
+            "status": "pending" if DB["approval_mode"] else "active",
+        }
+        DB["users"][str(u.id)] = rec
+    rec["name"], rec["username"], rec["last_seen"] = u.full_name, u.username, now()
+    save_db()
+    if new:
+        for aid in ADMIN_IDS:
+            await ctx.bot.send_message(
+                aid, f"👤 مستخدم جديد: {label(rec)} ({u.id}) — {rec['status']}",
+                reply_markup=InlineKeyboardMarkup([[user_buttons(rec)]]),
+            )
+    if rec["status"] == "banned":
+        raise ApplicationHandlerStop
+    if rec["status"] == "pending":
+        if update.effective_chat:
+            await ctx.bot.send_message(update.effective_chat.id, "⏳ بانتظار موافقة الأدمن.")
+        raise ApplicationHandlerStop
+
+
+def panel_markup():
+    mode = "ON" if DB["approval_mode"] else "OFF"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 المستخدمين", callback_data="adm:list"),
+         InlineKeyboardButton("📈 إحصائيات", callback_data="adm:stats")],
+        [InlineKeyboardButton(f"🔐 وضع الموافقة: {mode}", callback_data="adm:mode")],
+    ])
+
+
+def stats_text():
+    us = DB["users"].values()
+    by = lambda s: sum(1 for x in us if x["status"] == s)
+    return (
+        "🛠 لوحة الأدمن\n"
+        f"👥 المستخدمين: {len(DB['users'])}\n"
+        f"✅ فعّال: {by('active')} · ⏳ منتظر: {by('pending')} · 🚫 محظور: {by('banned')}\n"
+        f"📤 مجموع الرفع: {sum(x.get('uploads', 0) for x in us)}\n"
+        f"🔐 وضع الموافقة: {'ON (المستخدم الجديد لازم تقبلو)' if DB['approval_mode'] else 'OFF'}\n"
+        f"📁 {folder_url()}"
+    )
+
+
+async def admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    await update.message.reply_text(stats_text(), reply_markup=panel_markup())
+
+
+def set_status(uid, status):
+    rec = DB["users"].get(str(uid))
+    if rec:
+        rec["status"] = status
+        save_db()
+    return rec
+
+
+async def ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update) or not ctx.args or not ctx.args[0].isdigit():
+        return
+    rec = set_status(ctx.args[0], "banned")
+    await update.message.reply_text(f"🚫 {label(rec)}" if rec else "ما لقيت هالـ ID")
+
+
+async def unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update) or not ctx.args or not ctx.args[0].isdigit():
+        return
+    rec = set_status(ctx.args[0], "active")
+    await update.message.reply_text(f"♻️ {label(rec)}" if rec else "ما لقيت هالـ ID")
+
+
+async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    if cq.from_user.id not in ADMIN_IDS:
+        await cq.answer("مو أدمن", show_alert=True)
+        return
+    await cq.answer()
+    parts = cq.data.split(":")
+    action = parts[1]
+
+    if action == "set":
+        rec = set_status(parts[2], parts[3])
+        if rec and parts[3] == "banned":
+            note = "🚫 انحظرت."
+        elif rec:
+            note = "✅ تم السماح لك."
+        else:
+            note = None
+        if note:
+            try:
+                await ctx.bot.send_message(int(parts[2]), note)
+            except Exception:
+                pass
+        action = "list"
+    elif action == "mode":
+        DB["approval_mode"] = not DB["approval_mode"]
+        save_db()
+        await cq.edit_message_text(stats_text(), reply_markup=panel_markup())
+        return
+
+    if action == "stats":
+        await cq.edit_message_text(stats_text(), reply_markup=panel_markup())
+    elif action == "list":
+        recs = sorted(DB["users"].values(), key=lambda r: r.get("last_seen", ""), reverse=True)[:15]
+        icon = {"active": "✅", "pending": "⏳", "banned": "🚫"}
+        lines = [
+            f"{icon[r['status']]} {label(r)} · {r['id']} · رفع: {r.get('uploads', 0)} · آخر ظهور: {r.get('last_seen', '-')}"
+            for r in recs
+        ] or ["ما في مستخدمين بعد."]
+        rows = [[user_buttons(r)] for r in recs]
+        rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="adm:stats")])
+        await cq.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+
+
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     await cq.answer()
@@ -249,14 +418,22 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cq.message.reply_text("شو الاسم الجديد للملف؟")
 
 
+if not ADMIN_IDS:
+    print("WARNING: ADMIN_IDS not set -> no admin panel. Get your ID from @userinfobot")
+
 app = ApplicationBuilder().token(BOT_TOKEN).build()
+app.add_handler(TypeHandler(Update, gate), group=-1)
+app.add_handler(CommandHandler("admin", admin))
+app.add_handler(CommandHandler("ban", ban))
+app.add_handler(CommandHandler("unban", unban))
+app.add_handler(CallbackQueryHandler(on_admin_button, pattern=r"^adm:"))
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("status", status))
 app.add_handler(CommandHandler("newfolder", newfolder))
 app.add_handler(CommandHandler("folder", folder))
 app.add_handler(CommandHandler("skip", skip))
 app.add_handler(CommandHandler("skipall", skipall))
-app.add_handler(CallbackQueryHandler(on_button))
+app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(status|ren:)"))
 app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(STATUS_BTN)}$"), status))
 app.add_handler(MessageHandler(filters.ATTACHMENT, on_file))
 app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

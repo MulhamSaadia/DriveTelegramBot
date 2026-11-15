@@ -9,12 +9,19 @@ Telegram bot saves any file sent to it into a Google Drive folder. Creates folde
 - Status: `/status` or the "📊 الحالة" button
 - `/newfolder <name>` create + switch Drive folder, `/folder` show link
 
+## Admin panel
+Set `ADMIN_IDS` (comma-separated Telegram IDs, get yours from @userinfobot).
+- `/admin`: stats, user list (last seen, upload count), ban / unban / approve buttons
+- Approval mode: new users blocked until admin approves (toggle in panel)
+- Admins get a notification on each new user; `/ban <id>`, `/unban <id>`
+- Users stored in `users.json` (git-ignored)
+
 ## Setup
 1. Create bot with @BotFather → `BOT_TOKEN`
 2. Google Cloud Console → enable Drive API → OAuth client (Desktop app) → save as `credentials.json`
 3. ```
    pip install -r requirements.txt
-   BOT_TOKEN=... python bot.py
+   BOT_TOKEN=... ADMIN_IDS=123456789 python bot.py
    ```
 4. First run opens browser for Google login → `token.json` saved.
 

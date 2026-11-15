@@ -3,3 +3,4 @@ credentials.json
 folder_id.txt
 __pycache__/
 .env
+users.json
