@@ -1,19 +1,26 @@
-"""DriveTelegramBot: send files to Telegram bot -> saved to a Google Drive folder.
+"""DriveTelegramBot: send files to a Telegram bot -> saved to a Google Drive folder.
 
-Setup:
-  pip install -r requirements.txt
-  env BOT_TOKEN=<from @BotFather>
-  credentials.json = Google OAuth client (Desktop app), next to bot.py
-  python bot.py   (first run opens browser for Drive login -> token.json)
+Env vars:
+  BOT_TOKEN          Telegram bot token (@BotFather)
+  ADMIN_IDS          comma-separated Telegram user IDs of admins (@userinfobot)
+  DATABASE_URL       Postgres connection string (Supabase pooler URI)
+  GOOGLE_TOKEN_JSON  contents of token.json (authorized-user JSON w/ refresh token)
+  FOLDER_NAME        optional, default "Telegram Uploads"
+
+Local first run (to create token.json): put credentials.json next to bot.py and run;
+a browser opens for Google login. Then paste token.json contents into GOOGLE_TOKEN_JSON on the server.
 
 Flow:
-  - send 1+ files (albums / many at once ok) -> bot asks name for each (/skip, /skipall = default names)
+  - send 1+ files -> bot asks name for each (/skip, /skipall = default names)
   - after upload: button to rename the Drive file
-  - status: /status, "📊 الحالة" button
-  - /newfolder <name> creates + switches folder, /folder shows link
+  - status: /status or "📊 الحالة" button
+  - /newfolder <name>, /folder
+  - admin: /admin (users, ban/unban, approval mode), /ban <id>, /unban <id>
 Telegram bot download limit: 20MB per file.
 """
 import io, os, re, json, datetime, mimetypes
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
 )
@@ -28,51 +35,78 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+DATABASE_URL = os.environ["DATABASE_URL"]
 DEFAULT_FOLDER = os.environ.get("FOLDER_NAME", "Telegram Uploads")
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-ID_FILE = "folder_id.txt"
 STATUS_BTN = "📊 الحالة"
-USERS_FILE = "users.json"
-# comma-separated Telegram user IDs of admins (get yours from @userinfobot)
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 
 
-# ---------- users / access control ----------
-def load_db():
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {"users": {}, "approval_mode": False}
+# ---------- database (Supabase Postgres, schema "drivebot") ----------
+def q(sql, args=(), fetch=None):
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, args)
+            if fetch == "one":
+                return cur.fetchone()
+            if fetch == "all":
+                return cur.fetchall()
+    finally:
+        conn.close()
 
 
-DB = load_db()
+def get_setting(key, default=None):
+    r = q("select value from drivebot.settings where key=%s", (key,), "one")
+    return r["value"] if r else default
 
 
-def save_db():
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(DB, f, ensure_ascii=False, indent=1)
+def set_setting(key, value):
+    q(
+        "insert into drivebot.settings (key, value) values (%s, %s) "
+        "on conflict (key) do update set value = excluded.value",
+        (key, value),
+    )
 
 
-def now():
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+def touch_user(u, default_status):
+    return q(
+        "insert into drivebot.users (id, name, username, status) values (%s, %s, %s, %s) "
+        "on conflict (id) do update set name = excluded.name, username = excluded.username, last_seen = now() "
+        "returning *, (xmax = 0) as is_new",
+        (u.id, u.full_name, u.username, default_status),
+        "one",
+    )
+
+
+def set_status(uid, status):
+    return q("update drivebot.users set status=%s where id=%s returning *", (status, int(uid)), "one")
+
+
+def inc_uploads(uid):
+    q("update drivebot.users set uploads = uploads + 1 where id=%s", (uid,))
 
 
 def label(rec):
     return f"@{rec['username']}" if rec.get("username") else rec["name"]
 
 
-# ---------- Drive ----------
+# ---------- Google Drive ----------
 def drive_service():
     creds = None
-    if os.path.exists("token.json"):
+    tok = os.environ.get("GOOGLE_TOKEN_JSON")
+    if tok:
+        creds = Credentials.from_authorized_user_info(json.loads(tok), SCOPES)
+    elif os.path.exists("token.json"):
         creds = Credentials.from_authorized_user_file("token.json", SCOPES)
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
             creds = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES).run_local_server(port=0)
-        with open("token.json", "w") as f:
-            f.write(creds.to_json())
+        if not tok:
+            with open("token.json", "w") as f:
+                f.write(creds.to_json())
     return build("drive", "v3", credentials=creds)
 
 
@@ -83,15 +117,12 @@ def make_folder(name):
     r = drive.files().create(
         body={"name": name, "mimeType": "application/vnd.google-apps.folder"}, fields="id"
     ).execute()
-    with open(ID_FILE, "w") as f:
-        f.write(r["id"])
+    set_setting("folder_id", r["id"])
     return r["id"]
 
 
 def folder_id():
-    if os.path.exists(ID_FILE):
-        return open(ID_FILE).read().strip()
-    return make_folder(DEFAULT_FOLDER)
+    return get_setting("folder_id") or make_folder(DEFAULT_FOLDER)
 
 
 def folder_url():
@@ -120,11 +151,11 @@ def kb_status():
 
 
 def status_text(ud):
-    q = ud.get("queue", [])
+    qd = ud.get("queue", [])
     up = ud.get("uploaded", [])
-    lines = [f"⏳ بالانتظار: {len(q)}", f"✅ انرفع: {len(up)}"]
-    if q:
-        lines.append(f"التالي: {q[0]['label']}")
+    lines = [f"⏳ بالانتظار: {len(qd)}", f"✅ انرفع: {len(up)}"]
+    if qd:
+        lines.append(f"التالي: {qd[0]['label']}")
     if up:
         lines.append(f"آخر ملف: {up[-1]['name']}")
     lines.append(f"📁 {folder_url()}")
@@ -132,12 +163,12 @@ def status_text(ud):
 
 
 async def ask_next(ctx, chat_id, ud):
-    q = ud.get("queue", [])
-    if not q:
+    qd = ud.get("queue", [])
+    if not qd:
         return
     await ctx.bot.send_message(
         chat_id,
-        f"شو الاسم يلي بدك ياه للملف؟\n«{q[0]['label']}» (بالانتظار: {len(q)})\n"
+        f"شو الاسم يلي بدك ياه للملف؟\n«{qd[0]['label']}» (بالانتظار: {len(qd)})\n"
         "/skip = اسم افتراضي · /skipall = الكل افتراضي",
         reply_markup=kb_status(),
     )
@@ -155,10 +186,7 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
         body={"name": name, "parents": [folder_id()]}, media_body=media, fields="id"
     ).execute()
     ud.setdefault("uploaded", []).append({"id": r["id"], "name": name})
-    rec = DB["users"].get(str(item.get("uid")))
-    if rec:
-        rec["uploads"] = rec.get("uploads", 0) + 1
-        save_db()
+    inc_uploads(item["uid"])
     await ctx.bot.send_message(chat_id, f"✅ انرفع: {name}", reply_markup=kb_after_upload(r["id"]))
 
 
@@ -247,28 +275,38 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # name for the next queued file
-    q = ud.get("queue", [])
-    if not q:
+    qd = ud.get("queue", [])
+    if not qd:
         return
-    item = q.pop(0)
+    item = qd.pop(0)
     await upload_item(ctx, chat_id, ud, item, text)
     await ask_next(ctx, chat_id, ud)
 
 
 async def skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
-    q = ud.get("queue", [])
-    if not q:
+    qd = ud.get("queue", [])
+    if not qd:
         return
-    await upload_item(ctx, update.message.chat_id, ud, q.pop(0), None)
+    await upload_item(ctx, update.message.chat_id, ud, qd.pop(0), None)
     await ask_next(ctx, update.message.chat_id, ud)
 
 
 async def skipall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
-    q = ud.get("queue", [])
-    while q:
-        await upload_item(ctx, update.message.chat_id, ud, q.pop(0), None)
+    qd = ud.get("queue", [])
+    while qd:
+        await upload_item(ctx, update.message.chat_id, ud, qd.pop(0), None)
+
+
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cq = update.callback_query
+    await cq.answer()
+    if cq.data == "status":
+        await cq.message.reply_text(status_text(ctx.user_data))
+    elif cq.data.startswith("ren:"):
+        ctx.user_data["renaming"] = cq.data[4:]
+        await cq.message.reply_text("شو الاسم الجديد للملف؟")
 
 
 # ---------- access gate + admin panel ----------
@@ -276,7 +314,7 @@ def is_admin(update):
     return update.effective_user and update.effective_user.id in ADMIN_IDS
 
 
-def user_buttons(rec):
+def user_button(rec):
     uid, st = rec["id"], rec["status"]
     if st == "banned":
         return InlineKeyboardButton(f"♻️ فك حظر {label(rec)}", callback_data=f"adm:set:{uid}:active")
@@ -290,22 +328,13 @@ async def gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not u or u.id in ADMIN_IDS:
         return
-    rec = DB["users"].get(str(u.id))
-    new = rec is None
-    if new:
-        rec = {
-            "id": u.id, "name": u.full_name, "username": u.username,
-            "first_seen": now(), "uploads": 0,
-            "status": "pending" if DB["approval_mode"] else "active",
-        }
-        DB["users"][str(u.id)] = rec
-    rec["name"], rec["username"], rec["last_seen"] = u.full_name, u.username, now()
-    save_db()
-    if new:
+    default = "pending" if get_setting("approval_mode", "false") == "true" else "active"
+    rec = touch_user(u, default)
+    if rec["is_new"]:
         for aid in ADMIN_IDS:
             await ctx.bot.send_message(
                 aid, f"👤 مستخدم جديد: {label(rec)} ({u.id}) — {rec['status']}",
-                reply_markup=InlineKeyboardMarkup([[user_buttons(rec)]]),
+                reply_markup=InlineKeyboardMarkup([[user_button(rec)]]),
             )
     if rec["status"] == "banned":
         raise ApplicationHandlerStop
@@ -316,7 +345,7 @@ async def gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 def panel_markup():
-    mode = "ON" if DB["approval_mode"] else "OFF"
+    mode = "ON" if get_setting("approval_mode", "false") == "true" else "OFF"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("👥 المستخدمين", callback_data="adm:list"),
          InlineKeyboardButton("📈 إحصائيات", callback_data="adm:stats")],
@@ -325,14 +354,20 @@ def panel_markup():
 
 
 def stats_text():
-    us = DB["users"].values()
-    by = lambda s: sum(1 for x in us if x["status"] == s)
+    rows = q(
+        "select status, count(*) as c, coalesce(sum(uploads), 0) as up from drivebot.users group by status",
+        fetch="all",
+    )
+    by = {r["status"]: r["c"] for r in rows}
+    total = sum(by.values())
+    uploads = sum(int(r["up"]) for r in rows)
+    on = get_setting("approval_mode", "false") == "true"
     return (
         "🛠 لوحة الأدمن\n"
-        f"👥 المستخدمين: {len(DB['users'])}\n"
-        f"✅ فعّال: {by('active')} · ⏳ منتظر: {by('pending')} · 🚫 محظور: {by('banned')}\n"
-        f"📤 مجموع الرفع: {sum(x.get('uploads', 0) for x in us)}\n"
-        f"🔐 وضع الموافقة: {'ON (المستخدم الجديد لازم تقبلو)' if DB['approval_mode'] else 'OFF'}\n"
+        f"👥 المستخدمين: {total}\n"
+        f"✅ فعّال: {by.get('active', 0)} · ⏳ منتظر: {by.get('pending', 0)} · 🚫 محظور: {by.get('banned', 0)}\n"
+        f"📤 مجموع الرفع: {uploads}\n"
+        f"🔐 وضع الموافقة: {'ON (المستخدم الجديد لازم تقبلو)' if on else 'OFF'}\n"
         f"📁 {folder_url()}"
     )
 
@@ -341,14 +376,6 @@ async def admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
     await update.message.reply_text(stats_text(), reply_markup=panel_markup())
-
-
-def set_status(uid, status):
-    rec = DB["users"].get(str(uid))
-    if rec:
-        rec["status"] = status
-        save_db()
-    return rec
 
 
 async def ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -376,46 +403,30 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "set":
         rec = set_status(parts[2], parts[3])
-        if rec and parts[3] == "banned":
-            note = "🚫 انحظرت."
-        elif rec:
-            note = "✅ تم السماح لك."
-        else:
-            note = None
-        if note:
+        if rec:
             try:
-                await ctx.bot.send_message(int(parts[2]), note)
+                await ctx.bot.send_message(rec["id"], "🚫 انحظرت." if parts[3] == "banned" else "✅ تم السماح لك.")
             except Exception:
                 pass
         action = "list"
     elif action == "mode":
-        DB["approval_mode"] = not DB["approval_mode"]
-        save_db()
+        on = get_setting("approval_mode", "false") == "true"
+        set_setting("approval_mode", "false" if on else "true")
         await cq.edit_message_text(stats_text(), reply_markup=panel_markup())
         return
 
     if action == "stats":
         await cq.edit_message_text(stats_text(), reply_markup=panel_markup())
     elif action == "list":
-        recs = sorted(DB["users"].values(), key=lambda r: r.get("last_seen", ""), reverse=True)[:15]
+        recs = q("select * from drivebot.users order by last_seen desc limit 15", fetch="all")
         icon = {"active": "✅", "pending": "⏳", "banned": "🚫"}
         lines = [
-            f"{icon[r['status']]} {label(r)} · {r['id']} · رفع: {r.get('uploads', 0)} · آخر ظهور: {r.get('last_seen', '-')}"
+            f"{icon[r['status']]} {label(r)} · {r['id']} · رفع: {r['uploads']} · آخر ظهور: {r['last_seen']:%Y-%m-%d %H:%M}"
             for r in recs
         ] or ["ما في مستخدمين بعد."]
-        rows = [[user_buttons(r)] for r in recs]
+        rows = [[user_button(r)] for r in recs]
         rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="adm:stats")])
         await cq.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
-
-
-async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cq = update.callback_query
-    await cq.answer()
-    if cq.data == "status":
-        await cq.message.reply_text(status_text(ctx.user_data))
-    elif cq.data.startswith("ren:"):
-        ctx.user_data["renaming"] = cq.data[4:]
-        await cq.message.reply_text("شو الاسم الجديد للملف؟")
 
 
 if not ADMIN_IDS:
