@@ -9,6 +9,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py user_drive.py start.sh ./
 RUN python -m py_compile bot.py user_drive.py
+COPY tests ./tests
+RUN python -m unittest discover -s tests -v
 RUN chmod +x start.sh && mkdir -p /data
 
 # env needed: BOT_TOKEN, ADMIN_IDS, DATABASE_URL, GOOGLE_TOKEN_JSON,
