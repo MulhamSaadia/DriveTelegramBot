@@ -46,7 +46,6 @@ STATUS_BTN = "📊 الحالة"
 FILES_BTN = "📁 ملفاتي"
 NEW_FOLDER_BTN = "➕ مجلد جديد"
 UPLOAD_BTN = "📤 رفع ملف"
-ADMIN_BTN = "🛡️ السوبر أدمن"
 HELP_BTN = "❓ طريقة الاستخدام"
 # Optional: URL of a self-hosted Telegram Bot API server (run with --local) -> files up to 2GB.
 # Without it, Telegram's cloud Bot API limits downloads to 20MB.
@@ -645,9 +644,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text == STATUS_BTN:
         await status(update, ctx)
         return
-    if text == ADMIN_BTN:
-        await admin(update, ctx)
-        return
     if text == HELP_BTN:
         await help_command(update, ctx)
         return
@@ -749,8 +745,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- per-user browser ----------
 def _menu_keyboard(uid=None):
     rows = [[FILES_BTN, NEW_FOLDER_BTN], [UPLOAD_BTN, STATUS_BTN], [HELP_BTN]]
-    if uid is not None and int(uid) in ADMIN_IDS:
-        rows.append([ADMIN_BTN])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 async def _drive_call(fn, *args):
@@ -1169,7 +1163,6 @@ app = builder.build()
 app.add_error_handler(on_error)
 app.add_handler(TypeHandler(Update, gate), group=-1)
 app.add_handler(CommandHandler("admin", admin))
-app.add_handler(CommandHandler("superadmin", admin))
 app.add_handler(CommandHandler("ban", ban))
 app.add_handler(CommandHandler("unban", unban))
 app.add_handler(CallbackQueryHandler(on_admin_button, pattern=r"^adm:"))
