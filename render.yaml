@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: drive-telegram-bot
+    runtime: docker
+    plan: free
+    repo: https://github.com/MulhamSaadia/DriveTelegramBot
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
