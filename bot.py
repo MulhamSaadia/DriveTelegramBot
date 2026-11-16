@@ -269,9 +269,11 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
             await asyncio.to_thread(inc_uploads, item["uid"])
         except Exception as exc:
             print(f"Upload counter update failed: {type(exc).__name__}")
-        success = f"✅ انرفع على Google Drive: {name} (100%)"
-        if not await _edit_upload_status(status_msg, success, reply_markup=kb_after_upload(result["id"])):
-            await ctx.bot.send_message(chat_id, success, reply_markup=kb_after_upload(result["id"]))
+        await _edit_upload_status(status_msg, "✅ اكتمل الرفع إلى Drive (100%)")
+        await ctx.bot.send_message(
+            chat_id, f"✅ انرفع على Google Drive: {name}",
+            reply_markup=kb_after_upload(result["id"]),
+        )
     except Exception:
         await _edit_upload_status(status_msg, f"❌ ما اكتمل رفع «{name[:65]}». جرّب مرة ثانية.")
         raise
