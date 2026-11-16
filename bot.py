@@ -166,8 +166,8 @@ def kb_after_upload(file_id):
 
 def kb_status():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ اسم افتراضي", callback_data="skipone"),
-         InlineKeyboardButton("✅ الكل افتراضي", callback_data="skipall")],
+        [InlineKeyboardButton("الاسم الأصلي", callback_data="skipone"),
+         InlineKeyboardButton("الكل بأسمائه", callback_data="skipall")],
         [InlineKeyboardButton(FILES_BTN, callback_data="home"),
          InlineKeyboardButton(STATUS_BTN, callback_data="status")],
     ])
@@ -219,13 +219,13 @@ def _upload_progress_text(name, uploaded, total, elapsed):
         remaining = (total - uploaded) * elapsed / uploaded
         eta = f"⏳ باقي تقريباً: {_format_eta(remaining)}"
     elif uploaded >= total and total > 0:
-        eta = "⏳ عم أكد حفظ الملف على Drive..."
+        eta = "عم أتأكد من حفظ الملف..."
     else:
-        eta = "⏳ عم احسب الوقت من سرعة الرفع..."
+        eta = "عم احسب الوقت المتبقي..."
     mb = 1024 * 1024
     short_name = name if len(name) <= 65 else name[:62] + "…"
     return (
-        f"📤 عم ارفع على Google Drive: {short_name}\n"
+        f"عم ارفع «{short_name}» على Drive\n"
         f"{bar} {percent}%\n"
         f"{uploaded / mb:.1f} / {total / mb:.1f} MB\n"
         f"{eta}"
@@ -254,8 +254,8 @@ async def _get_telegram_file(bot, file_id, status_msg):
                 elapsed = int(time.monotonic() - started)
                 await _edit_upload_status(
                     status_msg,
-                    f"📥 عم جيب الملف من Telegram... مرّت {elapsed} ثانية.\n"
-                    "⏳ عم استنى تجهيز الملف؛ نسبة رفع Drive بتظهر بعده.",
+                    f"عم نزّل الملف من Telegram... مرّت {elapsed} ثانية.\n"
+                    "بس يجهز الملف، بفرجيك نسبة الرفع.",
                 )
         try:
             return await task
@@ -288,7 +288,7 @@ async def _download_telegram_file(tg_file, path, status_msg):
 
 async def upload_item(ctx, chat_id, ud, item, chosen_name):
     name = with_ext(chosen_name, item["ext"]) if chosen_name else item["default_name"]
-    status_msg = await ctx.bot.send_message(chat_id, f"📥 عم جهّز «{name[:65]}» من Telegram...")
+    status_msg = await ctx.bot.send_message(chat_id, f"عم جهّز «{name[:65]}» للرفع...")
     tmp_path = None
     try:
         tg_file = await _get_telegram_file(ctx.bot, item["file_id"], status_msg)
@@ -328,7 +328,7 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
             state["uploaded"] = total_bytes
             return result
 
-        await _edit_upload_status(status_msg, "⏳ الملف جاهز، عم استنى دوري للرفع...")
+        await _edit_upload_status(status_msg, "الملف جاهز، عم استنى بدء الرفع...")
         async with DRIVE_LOCK:
             started = time.monotonic()
             worker = asyncio.create_task(asyncio.to_thread(_create))
@@ -348,11 +348,11 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
             print(f"Upload counter update failed: {type(exc).__name__}")
         await _edit_upload_status(status_msg, "✅ اكتمل الرفع إلى Drive (100%)")
         await ctx.bot.send_message(
-            chat_id, f"✅ انرفع على Google Drive: {name}",
+            chat_id, f"تم رفع «{name}» على Drive.",
             reply_markup=kb_after_upload(result["id"]),
         )
     except Exception:
-        await _edit_upload_status(status_msg, f"❌ ما اكتمل رفع «{name[:65]}». الملف لسه بالطابور؛ اكتب الاسم أو /skip لإعادة المحاولة.")
+        await _edit_upload_status(status_msg, f"ما اكتمل رفع «{name[:65]}». الملف بعدها بالدور؛ ابعت الاسم مرة تانية أو /skip.")
         raise
     finally:
         if tmp_path is not None:
@@ -390,7 +390,7 @@ async def newfolder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         ctx.user_data.pop("renaming", None)
         ctx.user_data["creating_folder_in"] = active["id"]
-        await update.effective_message.reply_text("➕ شو اسم المجلد الجديد؟")
+        await update.effective_message.reply_text("شو بدك تسمي المجلد؟")
 
 
 async def folder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -467,7 +467,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         active = await _drive_call(USER_DRIVE.current, person.id, person.full_name)
         ud.pop("renaming", None)
         ud["creating_folder_in"] = active["id"]
-        await update.message.reply_text("➕ شو اسم المجلد الجديد؟")
+        await update.message.reply_text("شو بدك تسمي المجلد؟")
         return
     if text == UPLOAD_BTN:
         await upload_help(update, ctx)
@@ -629,7 +629,7 @@ async def show_browser(update, ctx, folder_id=None, page=0):
         f"📁 {folder.get('name', 'ملفاتي')}\n"
         f"📍 مكان الرفع: {current.get('name', '')}\n"
         f"📚 {len(items)} عنصر" + (" (أول 1000 فقط)" if more else "") + "\n\n" +
-        ("اضغط على ملف أو مجلد من القائمة 👇" if items else "المجلد فاضي. ابعت ملف أو أنشئ مجلد.")
+        ("اختار الملف أو المجلد من تحت." if items else "المجلد فاضي، ابعت ملف أو اعمل مجلد جديد.")
     )
     markup = InlineKeyboardMarkup(rows)
     if update.callback_query:
@@ -685,7 +685,7 @@ async def _create_and_select(update, ctx, parent_id, text):
         USER_DRIVE.create_folder, person.id, parent_id, text, person.full_name,
     )
     await _drive_call(USER_DRIVE.select, person.id, made["id"], person.full_name)
-    await update.effective_message.reply_text(f"✅ أنشأت «{made['name']}» وصار مجلد الرفع الحالي.")
+    await update.effective_message.reply_text(f"عملت مجلد «{made['name']}» وصار مكان الرفع الحالي.")
     await show_browser(update, ctx, made["id"])
 
 
@@ -710,13 +710,13 @@ async def on_browser_button(update, ctx):
             await show_item(update, ctx, arg)
         elif action == "choose":
             selected = await _drive_call(USER_DRIVE.select, uid, arg, display)
-            await cq.message.reply_text(f"✅ الرفع الجديد رح يروح على «{selected['name']}».")
+            await cq.message.reply_text(f"تمام، الرفع الجديد رح يروح على «{selected['name']}».")
             await show_browser(update, ctx, selected["id"])
         elif action == "add":
             await _drive_call(USER_DRIVE.require_folder, uid, arg, display)
             ctx.user_data.pop("renaming", None)
             ctx.user_data["creating_folder_in"] = arg
-            await cq.message.reply_text("➕ اكتب اسم المجلد الجديد:")
+            await cq.message.reply_text("اكتب اسم المجلد الجديد:")
         elif action == "trash":
             meta = await _drive_call(USER_DRIVE.require_item, uid, arg, display)
             root = await _drive_call(USER_DRIVE.ensure_root, uid, display)
@@ -734,7 +734,7 @@ async def on_browser_button(update, ctx):
             )
         elif action == "confirm":
             deleted = await _drive_call(USER_DRIVE.trash, uid, arg, display)
-            await cq.message.reply_text(f"✅ انتقل للسلة: {deleted.get('name', '')}")
+            await cq.message.reply_text(f"انتقل للسلة: {deleted.get('name', '')}")
             parent = (deleted.get("parents") or [None])[0]
             await show_browser(update, ctx, parent)
         elif action == "cancel":
@@ -785,8 +785,9 @@ async def gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rec = touch_user(u, default)
     if rec["is_new"]:
         for aid in ADMIN_IDS:
+            status_label = {"pending": "بانتظار الموافقة", "active": "مفعّل", "banned": "محظور"}.get(rec["status"], rec["status"])
             await ctx.bot.send_message(
-                aid, f"مستخدم جديد: {label(rec)} ({u.id})\nالحالة: {rec['status']}",
+                aid, f"مستخدم جديد: {label(rec)} ({u.id})\nالحالة: {status_label}",
                 reply_markup=InlineKeyboardMarkup([[user_button(rec)]]),
             )
     if rec["status"] == "banned":
