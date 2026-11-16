@@ -29,7 +29,9 @@ from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
     TypeHandler, ApplicationHandlerStop, ContextTypes, filters,
 )
-from telegram.error import NetworkError, TimedOut
+from telegram.error import NetworkError, TimedOut, BadRequest
+from googleapiclient.errors import HttpError
+from user_drive import UserDrive, FOLDER_MIME, FolderAccessError, safe_name
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -41,6 +43,9 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 DEFAULT_FOLDER = os.environ.get("FOLDER_NAME", "Telegram Uploads")
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 STATUS_BTN = "📊 الحالة"
+FILES_BTN = "📁 ملفاتي"
+NEW_FOLDER_BTN = "➕ مجلد جديد"
+UPLOAD_BTN = "📤 رفع ملف"
 # Optional: URL of a self-hosted Telegram Bot API server (run with --local) -> files up to 2GB.
 # Without it, Telegram's cloud Bot API limits downloads to 20MB.
 BOT_API_URL = os.environ.get("BOT_API_URL", "").rstrip("/")
@@ -136,6 +141,9 @@ def folder_url():
     return f"https://drive.google.com/drive/folders/{folder_id()}"
 
 
+USER_DRIVE = UserDrive(drive, get_setting, set_setting, folder_id)
+
+
 def clean(name):
     return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
 
@@ -147,17 +155,23 @@ def with_ext(name, ext):
 
 # ---------- UI helpers ----------
 def kb_after_upload(file_id):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✏️ غيّر الاسم", callback_data=f"ren:{file_id}"),
-        InlineKeyboardButton(STATUS_BTN, callback_data="status"),
-    ]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ غيّر الاسم", callback_data=f"ren:{file_id}"),
+         InlineKeyboardButton("🗑 حذف", callback_data=f"trash:{file_id}")],
+        [InlineKeyboardButton(FILES_BTN, callback_data="home"),
+         InlineKeyboardButton(STATUS_BTN, callback_data="status")],
+    ])
 
 
 def kb_status():
-    return InlineKeyboardMarkup([[InlineKeyboardButton(STATUS_BTN, callback_data="status")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ اسم افتراضي", callback_data="skipone"),
+         InlineKeyboardButton("✅ الكل افتراضي", callback_data="skipall")],
+        [InlineKeyboardButton(FILES_BTN, callback_data="home"),
+         InlineKeyboardButton(STATUS_BTN, callback_data="status")],
+    ])
 
-
-def status_text(ud):
+def status_text(ud, folder_name=None):
     qd = ud.get("queue", [])
     up = ud.get("uploaded", [])
     lines = [f"⏳ بالانتظار: {len(qd)}", f"✅ انرفع: {len(up)}"]
@@ -165,7 +179,8 @@ def status_text(ud):
         lines.append(f"التالي: {qd[0]['label']}")
     if up:
         lines.append(f"آخر ملف: {up[-1]['name']}")
-    lines.append(f"📁 {folder_url()}")
+    if folder_name:
+        lines.append(f"📁 مكان الرفع: {folder_name}")
     return "\n".join(lines)
 
 
@@ -176,6 +191,7 @@ async def ask_next(ctx, chat_id, ud):
     await ctx.bot.send_message(
         chat_id,
         f"شو الاسم يلي بدك ياه للملف؟\n«{qd[0]['label']}» (بالانتظار: {len(qd)})\n"
+        f"📁 مكان الرفع: {qd[0].get('target_name', 'ملفاتي')}\n"
         "/skip = اسم افتراضي · /skipall = الكل افتراضي",
         reply_markup=kb_status(),
     )
@@ -275,7 +291,10 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
     tmp_path = None
     try:
         tg_file = await _get_telegram_file(ctx.bot, item["file_id"], status_msg)
-        parent = await asyncio.to_thread(folder_id)
+        parent = (await _drive_call(
+            USER_DRIVE.require_folder, item["uid"], item["target_folder"],
+            item.get("owner_name", "مستخدم"),
+        ))["id"]
         # With local Bot API, get_file() already returns a shared on-disk path.
         # Reuse it instead of duplicating multi-GB files on Render's ephemeral disk.
         local_path = tg_file.file_path
@@ -296,7 +315,9 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
                 chunksize=8 * 1024 * 1024,
             )
             request = drive.files().create(
-                body={"name": name, "parents": [parent]}, media_body=media, fields="id"
+                body={"name": name, "parents": [parent],
+                      "appProperties": {"tg_owner": str(item["uid"]), "tg_role": "file"}},
+                media_body=media, fields="id"
             )
             result = None
             while result is None:
@@ -343,24 +364,36 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
 # ---------- handlers ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "ابعتلي أي ملف (أو كذا ملف سوا) وبرفعو على Drive.",
-        reply_markup=ReplyKeyboardMarkup([[STATUS_BTN]], resize_keyboard=True),
+        "أهلاً! صار لكل مستخدم مجلد خاص داخل Google Drive تبع البوت.\n"
+        "📁 تصفح ملفاتك، ➕ أنشئ مجلد، أو ابعت أي ملف لرفعه.",
+        reply_markup=_menu_keyboard(),
     )
 
 
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(status_text(ctx.user_data))
+    person = update.effective_user
+    active = await _drive_call(USER_DRIVE.current, person.id, person.full_name)
+    await update.effective_message.reply_text(
+        status_text(ctx.user_data, active["name"]), reply_markup=_menu_keyboard(),
+    )
 
 
 async def newfolder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    name = " ".join(ctx.args) or DEFAULT_FOLDER
-    fid = make_folder(name)
-    await update.message.reply_text(f"📁 {name}\nhttps://drive.google.com/drive/folders/{fid}")
+    if not await _private_ui(update):
+        return
+    person = update.effective_user
+    active = await _drive_call(USER_DRIVE.current, person.id, person.full_name)
+    name = " ".join(ctx.args).strip() if ctx.args else ""
+    if name:
+        await _create_and_select(update, ctx, active["id"], name)
+    else:
+        ctx.user_data.pop("renaming", None)
+        ctx.user_data["creating_folder_in"] = active["id"]
+        await update.effective_message.reply_text("➕ شو اسم المجلد الجديد؟")
 
 
 async def folder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(folder_url())
-
+    await show_browser(update, ctx)
 
 async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m = update.message
@@ -393,8 +426,12 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     u = m.from_user
     base = os.path.splitext(orig)[0] if orig else "file"
+    target = await _drive_call(USER_DRIVE.current, u.id, u.full_name)
     item = {
         "file_id": att.file_id,
+        "owner_name": u.full_name,
+        "target_folder": target["id"],
+        "target_name": target["name"],
         "uid": u.id,
         "mime": mime,
         "ext": ext,
@@ -416,29 +453,60 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
     chat_id = update.message.chat_id
     text = update.message.text
+    person = update.effective_user
 
-    # rename an already-uploaded file
+    if text == FILES_BTN:
+        ud.pop("renaming", None)
+        ud.pop("creating_folder_in", None)
+        await user_files(update, ctx)
+        return
+    if text == NEW_FOLDER_BTN:
+        if not await _private_ui(update):
+            return
+        active = await _drive_call(USER_DRIVE.current, person.id, person.full_name)
+        ud.pop("renaming", None)
+        ud["creating_folder_in"] = active["id"]
+        await update.message.reply_text("➕ شو اسم المجلد الجديد؟")
+        return
+    if text == UPLOAD_BTN:
+        await upload_help(update, ctx)
+        return
+    if text == STATUS_BTN:
+        await status(update, ctx)
+        return
+
+    if ud.get("creating_folder_in"):
+        if not await _private_ui(update):
+            return
+        await _create_and_select(update, ctx, ud["creating_folder_in"], text)
+        ud.pop("creating_folder_in", None)
+        return
+
     if ud.get("renaming"):
-        fid = ud.pop("renaming")
-        cur = drive.files().get(fileId=fid, fields="name").execute()["name"]
-        new = with_ext(text, os.path.splitext(cur)[1])
-        drive.files().update(fileId=fid, body={"name": new}).execute()
+        if not await _private_ui(update):
+            return
+        fid = ud["renaming"]
+        old = await _drive_call(USER_DRIVE.require_item, person.id, fid, person.full_name)
+        name = safe_name(text)
+        if old.get("mimeType") != FOLDER_MIME:
+            name = with_ext(name, os.path.splitext(old.get("name", ""))[1])
+        renamed = await _drive_call(USER_DRIVE.rename, person.id, fid, name, person.full_name)
+        ud.pop("renaming", None)
         for x in ud.get("uploaded", []):
             if x["id"] == fid:
-                x["name"] = new
-        await update.message.reply_text(f"✏️ الاسم الجديد: {new}", reply_markup=kb_after_upload(fid))
+                x["name"] = renamed["name"]
+        await update.message.reply_text(
+            f"✏️ الاسم الجديد: {renamed['name']}", reply_markup=_menu_keyboard(),
+        )
         await ask_next(ctx, chat_id, ud)
         return
 
-    # name for the next queued file
-    qd = ud.get("queue", [])
-    if not qd:
+    queue = ud.get("queue", [])
+    if not queue:
         return
-    item = qd[0]
-    await upload_item(ctx, chat_id, ud, item, text)
-    qd.pop(0)
+    await upload_item(ctx, chat_id, ud, queue[0], text)
+    queue.pop(0)
     await ask_next(ctx, chat_id, ud)
-
 
 async def skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
@@ -462,11 +530,233 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     await cq.answer()
     if cq.data == "status":
-        await cq.message.reply_text(status_text(ctx.user_data))
+        person = update.effective_user
+        active = await _drive_call(USER_DRIVE.current, person.id, person.full_name)
+        await cq.message.reply_text(status_text(ctx.user_data, active["name"]))
     elif cq.data.startswith("ren:"):
-        ctx.user_data["renaming"] = cq.data[4:]
-        await cq.message.reply_text("شو الاسم الجديد للملف؟")
+        if not await _private_ui(update):
+            return
+        person = update.effective_user
+        fid = cq.data[4:]
+        meta = await _drive_call(USER_DRIVE.require_item, person.id, fid, person.full_name)
+        if (meta.get("appProperties") or {}).get("tg_role") == "root":
+            await cq.message.reply_text("❌ ما فيك تغيّر اسم المجلد الأساسي.")
+            return
+        ctx.user_data.pop("creating_folder_in", None)
+        ctx.user_data["renaming"] = fid
+        await cq.message.reply_text(f"✏️ شو الاسم الجديد لـ «{meta.get('name', 'الملف')}»؟")
 
+
+# ---------- per-user browser ----------
+def _menu_keyboard():
+    return ReplyKeyboardMarkup(
+        [[FILES_BTN, NEW_FOLDER_BTN], [UPLOAD_BTN, STATUS_BTN]], resize_keyboard=True,
+    )
+
+
+async def _drive_call(fn, *args):
+    async with DRIVE_LOCK:
+        return await asyncio.to_thread(fn, *args)
+
+
+async def _private_ui(update):
+    if update.effective_chat.type == "private":
+        return True
+    await update.effective_message.reply_text("🔒 لإدارة ملفاتك افتح محادثة خاصة مع البوت.")
+    return False
+
+
+def _browser_snapshot(uid, display, folder_id):
+    root = USER_DRIVE.ensure_root(uid, display)
+    folder = USER_DRIVE.require_folder(uid, folder_id or root["id"], display)
+    active = USER_DRIVE.current(uid, display)
+    items, more = USER_DRIVE.list_children(uid, folder["id"], display)
+    return root, folder, active, items, more
+
+
+def _item_button(label, verb, file_id):
+    payload = f"{verb}:{file_id}"
+    if len(payload.encode("utf-8")) > 64:
+        return None
+    return InlineKeyboardButton(label, callback_data=payload)
+
+
+async def show_browser(update, ctx, folder_id=None, page=0):
+    if not await _private_ui(update):
+        return
+    person = update.effective_user
+    root, folder, current, items, more = await _drive_call(
+        _browser_snapshot, person.id, person.full_name, folder_id,
+    )
+    limit = 8
+    pages = max(0, (len(items) - 1) // limit)
+    page = max(0, min(int(page), pages))
+    rows = []
+    for item in items[page * limit:(page + 1) * limit]:
+        is_folder = item.get("mimeType") == FOLDER_MIME
+        btn = _item_button(
+            ("📁 " if is_folder else "📄 ") + item.get("name", "ملف")[:36],
+            "nav" if is_folder else "item", item["id"],
+        )
+        if btn:
+            rows.append([btn])
+    pager = []
+    if page:
+        pager.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"page:{folder['id']}:{page-1}"))
+    if page < pages:
+        pager.append(InlineKeyboardButton("التالي ➡️", callback_data=f"page:{folder['id']}:{page+1}"))
+    if pager:
+        rows.append(pager)
+    rows.append([
+        InlineKeyboardButton("✅ خلي الرفع هون", callback_data=f"choose:{folder['id']}"),
+        InlineKeyboardButton("➕ مجلد جديد", callback_data=f"add:{folder['id']}"),
+    ])
+    controls = [InlineKeyboardButton("🔄 تحديث", callback_data=f"nav:{folder['id']}")]
+    if folder["id"] != root["id"]:
+        parent = (folder.get("parents") or [root["id"]])[0]
+        controls.append(InlineKeyboardButton("⬅️ رجوع", callback_data=f"nav:{parent}"))
+        deletion = _item_button("🗑 حذف هذا المجلد", "trash", folder["id"])
+        if deletion:
+            rows.append([deletion])
+    else:
+        controls.append(InlineKeyboardButton("🏠 مجلدي", callback_data="home"))
+    rows.append(controls)
+    summary = (
+        f"📁 {folder.get('name', 'ملفاتي')}\n"
+        f"📍 مكان الرفع: {current.get('name', '')}\n"
+        f"📚 {len(items)} عنصر" + (" (أول 1000 فقط)" if more else "") + "\n\n" +
+        ("اضغط على ملف أو مجلد من القائمة 👇" if items else "المجلد فاضي. ابعت ملف أو أنشئ مجلد.")
+    )
+    markup = InlineKeyboardMarkup(rows)
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(summary, reply_markup=markup)
+        except BadRequest as exc:
+            if "Message is not modified" not in str(exc):
+                await update.effective_message.reply_text(summary, reply_markup=markup)
+    else:
+        await update.effective_message.reply_text(summary, reply_markup=markup)
+
+
+async def show_item(update, ctx, file_id):
+    if not await _private_ui(update):
+        return
+    person = update.effective_user
+    meta = await _drive_call(USER_DRIVE.require_item, person.id, file_id, person.full_name)
+    if meta.get("mimeType") == FOLDER_MIME:
+        await show_browser(update, ctx, file_id)
+        return
+    parent = (meta.get("parents") or [None])[0]
+    size = int(meta.get("size") or 0) / (1024 * 1024)
+    text = f"📄 {meta.get('name', 'ملف')}\n📦 الحجم: {size:.1f} MB\n\nشو بدك تعمل؟"
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ تغيير الاسم", callback_data=f"ren:{file_id}"),
+         InlineKeyboardButton("🗑 حذف", callback_data=f"trash:{file_id}")],
+        [InlineKeyboardButton("⬅️ رجوع", callback_data=f"nav:{parent}")],
+    ])
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=markup)
+    else:
+        await update.effective_message.reply_text(text, reply_markup=markup)
+
+
+async def user_files(update, ctx):
+    await show_browser(update, ctx)
+
+
+async def upload_help(update, ctx):
+    if not await _private_ui(update):
+        return
+    person = update.effective_user
+    active = await _drive_call(USER_DRIVE.current, person.id, person.full_name)
+    await update.effective_message.reply_text(
+        f"📤 ابعت الملف هون، ورح يروح على «{active['name']}».\n"
+        "لتغيير المكان اضغط 📁 ملفاتي.", reply_markup=_menu_keyboard(),
+    )
+
+
+async def _create_and_select(update, ctx, parent_id, text):
+    person = update.effective_user
+    made = await _drive_call(
+        USER_DRIVE.create_folder, person.id, parent_id, text, person.full_name,
+    )
+    await _drive_call(USER_DRIVE.select, person.id, made["id"], person.full_name)
+    await update.effective_message.reply_text(f"✅ أنشأت «{made['name']}» وصار مجلد الرفع الحالي.")
+    await show_browser(update, ctx, made["id"])
+
+
+async def on_browser_button(update, ctx):
+    cq = update.callback_query
+    await cq.answer()
+    if not await _private_ui(update):
+        return
+    person = update.effective_user
+    uid, display = person.id, person.full_name
+    action, _, arg = cq.data.partition(":")
+    try:
+        if action == "home":
+            root = await _drive_call(USER_DRIVE.ensure_root, uid, display)
+            await show_browser(update, ctx, root["id"])
+        elif action == "nav":
+            await show_browser(update, ctx, arg)
+        elif action == "page":
+            fid, pg = arg.rsplit(":", 1)
+            await show_browser(update, ctx, fid, int(pg))
+        elif action == "item":
+            await show_item(update, ctx, arg)
+        elif action == "choose":
+            selected = await _drive_call(USER_DRIVE.select, uid, arg, display)
+            await cq.message.reply_text(f"✅ الرفع الجديد رح يروح على «{selected['name']}».")
+            await show_browser(update, ctx, selected["id"])
+        elif action == "add":
+            await _drive_call(USER_DRIVE.require_folder, uid, arg, display)
+            ctx.user_data.pop("renaming", None)
+            ctx.user_data["creating_folder_in"] = arg
+            await cq.message.reply_text("➕ اكتب اسم المجلد الجديد:")
+        elif action == "trash":
+            meta = await _drive_call(USER_DRIVE.require_item, uid, arg, display)
+            root = await _drive_call(USER_DRIVE.ensure_root, uid, display)
+            if meta["id"] == root["id"]:
+                raise FolderAccessError("المجلد الأساسي ما بينحذف.")
+            warn = ("⚠️ حذف المجلد بينقل كل محتوياته كمان للسلة.\n"
+                    if meta.get("mimeType") == FOLDER_MIME else "")
+            await cq.edit_message_text(
+                f"🗑 متأكد بدك تحذف «{meta['name']}»؟\n{warn}"
+                "ممكن تستعيده من سلة Google Drive.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🗑 نعم، للسلة", callback_data=f"confirm:{arg}"),
+                    InlineKeyboardButton("إلغاء", callback_data=f"cancel:{arg}"),
+                ]]),
+            )
+        elif action == "confirm":
+            deleted = await _drive_call(USER_DRIVE.trash, uid, arg, display)
+            await cq.message.reply_text(f"✅ انتقل للسلة: {deleted.get('name', '')}")
+            parent = (deleted.get("parents") or [None])[0]
+            await show_browser(update, ctx, parent)
+        elif action == "cancel":
+            meta = await _drive_call(USER_DRIVE.require_item, uid, arg, display)
+            if meta.get("mimeType") == FOLDER_MIME:
+                await show_browser(update, ctx, meta["id"])
+            else:
+                await show_item(update, ctx, arg)
+        elif action in ("skipone", "skipall"):
+            queue = ctx.user_data.get("queue", [])
+            if not queue:
+                await cq.message.reply_text("ما في ملفات بانتظار اسم.")
+                return
+            while queue:
+                await upload_item(ctx, cq.message.chat_id, ctx.user_data, queue[0], None)
+                queue.pop(0)
+                if action == "skipone":
+                    await ask_next(ctx, cq.message.chat_id, ctx.user_data)
+                    break
+    except (FolderAccessError, ValueError) as exc:
+        await cq.message.reply_text(f"❌ {exc}")
+    except HttpError as exc:
+        if getattr(exc.resp, "status", None) == 404:
+            await cq.message.reply_text("❌ الملف أو المجلد ما عاد موجود.")
+        else:
+            raise
 
 # ---------- access gate + admin panel ----------
 def is_admin(update):
@@ -648,8 +938,10 @@ app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("status", status))
 app.add_handler(CommandHandler("newfolder", newfolder))
 app.add_handler(CommandHandler("folder", folder))
+app.add_handler(CommandHandler("files", user_files))
 app.add_handler(CommandHandler("skip", skip))
 app.add_handler(CommandHandler("skipall", skipall))
+app.add_handler(CallbackQueryHandler(on_browser_button, pattern=r"^(home$|nav:|page:|item:|choose:|add:|trash:|confirm:|cancel:|skipone$|skipall$)"))
 app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(status|ren:)"))
 app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(STATUS_BTN)}$"), status))
 app.add_handler(MessageHandler(filters.ATTACHMENT, on_file))
