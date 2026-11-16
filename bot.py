@@ -19,7 +19,7 @@ Flow:
   - admin: /admin (users, ban/unban, approval mode), /ban <id>, /unban <id>
 Download limit: 20MB (cloud Bot API) or 2GB with BOT_API_URL (local Bot API server).
 """
-import asyncio, os, re, json, datetime, mimetypes, tempfile, traceback
+import asyncio, os, re, json, datetime, mimetypes, tempfile, traceback, time
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from telegram import (
@@ -181,31 +181,105 @@ async def ask_next(ctx, chat_id, ud):
 
 
 # ---------- upload ----------
+def _format_eta(seconds):
+    seconds = max(1, int(seconds))
+    if seconds < 60:
+        return f"{seconds} ثانية"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} دقيقة و{seconds} ثانية"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} ساعة و{minutes} دقيقة"
+
+
+def _upload_progress_text(name, uploaded, total, elapsed):
+    fraction = min(1.0, max(0.0, uploaded / total)) if total else 0.0
+    percent = int(fraction * 100)
+    blocks = int(fraction * 12)
+    bar = "█" * blocks + "░" * (12 - blocks)
+    if uploaded > 0 and uploaded < total:
+        remaining = (total - uploaded) * elapsed / uploaded
+        eta = f"⏳ باقي تقريباً: {_format_eta(remaining)}"
+    elif uploaded >= total and total > 0:
+        eta = "⏳ عم أكد حفظ الملف على Drive..."
+    else:
+        eta = "⏳ عم احسب الوقت من سرعة الرفع..."
+    mb = 1024 * 1024
+    short_name = name if len(name) <= 65 else name[:62] + "…"
+    return (
+        f"📤 عم ارفع على Google Drive: {short_name}\n"
+        f"{bar} {percent}%\n"
+        f"{uploaded / mb:.1f} / {total / mb:.1f} MB\n"
+        f"{eta}"
+    )
+
+
+async def _edit_upload_status(message, text, **kwargs):
+    try:
+        await message.edit_text(text, **kwargs)
+        return True
+    except Exception as exc:
+        print(f"Could not update progress message: {type(exc).__name__}")
+        return False
+
+
 async def upload_item(ctx, chat_id, ud, item, chosen_name):
-    tg_file = await ctx.bot.get_file(item["file_id"])
     name = with_ext(chosen_name, item["ext"]) if chosen_name else item["default_name"]
-    parent = await asyncio.to_thread(folder_id)
+    status_msg = await ctx.bot.send_message(chat_id, f"📥 عم جهّز «{name[:65]}» من Telegram...")
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=item["ext"] or ".bin")
     tmp.close()
     try:
-        await tg_file.download_to_drive(tmp.name)  # to disk, not RAM (works for big files)
-        media = MediaFileUpload(tmp.name, mimetype=item["mime"], resumable=True, chunksize=8 * 1024 * 1024)
+        tg_file = await ctx.bot.get_file(item["file_id"])
+        parent = await asyncio.to_thread(folder_id)
+        await tg_file.download_to_drive(tmp.name)  # disk, not RAM
+        total_bytes = os.path.getsize(tmp.name)
+        state = {"uploaded": 0}  # One writer (upload thread), one reader (event loop).
 
         def _create():
-            return drive.files().create(
+            media = MediaFileUpload(
+                tmp.name, mimetype=item["mime"], resumable=True,
+                chunksize=8 * 1024 * 1024,
+            )
+            request = drive.files().create(
                 body={"name": name, "parents": [parent]}, media_body=media, fields="id"
-            ).execute()
+            )
+            result = None
+            while result is None:
+                progress, result = request.next_chunk(num_retries=3)
+                if progress is not None:
+                    state["uploaded"] = min(total_bytes, progress.resumable_progress)
+            state["uploaded"] = total_bytes
+            return result
 
+        await _edit_upload_status(status_msg, "⏳ الملف جاهز، عم استنى دوري للرفع...")
         async with DRIVE_LOCK:
-            r = await asyncio.to_thread(_create)
+            started = time.monotonic()
+            worker = asyncio.create_task(asyncio.to_thread(_create))
+            last_text = None
+            while not worker.done():
+                body = _upload_progress_text(name, state["uploaded"], total_bytes, time.monotonic() - started)
+                if body != last_text:
+                    await _edit_upload_status(status_msg, body)
+                    last_text = body
+                await asyncio.wait({worker}, timeout=4)
+            result = await worker
+
+        ud.setdefault("uploaded", []).append({"id": result["id"], "name": name})
+        try:
+            await asyncio.to_thread(inc_uploads, item["uid"])
+        except Exception as exc:
+            print(f"Upload counter update failed: {type(exc).__name__}")
+        success = f"✅ انرفع على Google Drive: {name} (100%)"
+        if not await _edit_upload_status(status_msg, success, reply_markup=kb_after_upload(result["id"])):
+            await ctx.bot.send_message(chat_id, success, reply_markup=kb_after_upload(result["id"]))
+    except Exception:
+        await _edit_upload_status(status_msg, f"❌ ما اكتمل رفع «{name[:65]}». جرّب مرة ثانية.")
+        raise
     finally:
         try:
             os.unlink(tmp.name)
         except OSError:
             pass
-    ud.setdefault("uploaded", []).append({"id": r["id"], "name": name})
-    inc_uploads(item["uid"])
-    await ctx.bot.send_message(chat_id, f"✅ انرفع: {name}", reply_markup=kb_after_upload(r["id"]))
 
 
 # ---------- handlers ----------
