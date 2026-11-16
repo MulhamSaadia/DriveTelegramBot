@@ -475,6 +475,30 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
 if not ADMIN_IDS:
     print("WARNING: ADMIN_IDS not set -> no admin panel. Get your ID from @userinfobot")
 
+def start_health_server():
+    """Tiny HTTP endpoint for hosts that require an open port (Render/Koyeb free) + uptime pingers."""
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        do_HEAD = do_GET
+
+        def log_message(self, *a):
+            pass
+
+    threading.Thread(target=HTTPServer(("0.0.0.0", int(port)), H).serve_forever, daemon=True).start()
+
+
+start_health_server()
+
 builder = ApplicationBuilder().token(BOT_TOKEN)
 if BOT_API_URL:
     builder = builder.base_url(f"{BOT_API_URL}/bot").base_file_url(f"{BOT_API_URL}/file/bot").local_mode(True)

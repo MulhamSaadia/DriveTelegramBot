@@ -47,3 +47,6 @@ Deploy it on any Docker host (Railway, Fly.io, a VM...) with these variables:
 `BOT_TOKEN`, `ADMIN_IDS`, `DATABASE_URL`, `GOOGLE_TOKEN_JSON`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`.
 Log the bot out of the cloud API once before first start (see step 2 above).
 Never commit `token.json` / `credentials.json` / tokens (see `.gitignore`).
+
+### Free hosts that sleep (Render free, etc.)
+If `PORT` is set, the bot serves `GET /health` -> `ok`. Free web services sleep after ~15 min without HTTP traffic and the polling bot stops with them, so point a free pinger (UptimeRobot / cron-job.org) at `https://<your-service>/health` every 5-10 min. Note: the per-user queue lives in memory, so a restart drops files still waiting for a name.
