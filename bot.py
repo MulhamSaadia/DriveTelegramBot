@@ -47,6 +47,7 @@ FILES_BTN = "📁 ملفاتي"
 NEW_FOLDER_BTN = "➕ مجلد جديد"
 UPLOAD_BTN = "📤 رفع ملف"
 ADMIN_BTN = "🛡️ السوبر أدمن"
+HELP_BTN = "❓ طريقة الاستخدام"
 # Optional: URL of a self-hosted Telegram Bot API server (run with --local) -> files up to 2GB.
 # Without it, Telegram's cloud Bot API limits downloads to 20MB.
 BOT_API_URL = os.environ.get("BOT_API_URL", "").rstrip("/")
@@ -168,8 +169,7 @@ def kb_status():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("الاسم الأصلي", callback_data="skipone"),
          InlineKeyboardButton("الكل بأسمائه", callback_data="skipall")],
-        [InlineKeyboardButton(FILES_BTN, callback_data="home"),
-         InlineKeyboardButton(STATUS_BTN, callback_data="status")],
+        [InlineKeyboardButton(FILES_BTN, callback_data="home")],
     ])
 
 def status_text(ud, folder_name=None):
@@ -186,17 +186,152 @@ def status_text(ud, folder_name=None):
 
 
 async def ask_next(ctx, chat_id, ud):
-    pending = ud.get("queue", [])
-    if not pending:
+    queue = ud.get("queue", [])
+    if not queue:
         return
-    item = pending[0]
+    item = queue[0]
+    if not item.get("target_folder"):
+        await _show_upload_folders(ctx, chat_id, item)
+        return
     await ctx.bot.send_message(
         chat_id,
-        f"وصل «{item['label']}».\nشو بدك تسميه؟\n"
-        f"مجلد الرفع: {item.get('target_name', 'ملفاتي')}\n"
-        "اكتب الاسم أو اختار من الأزرار.",
+        f"المجلد: {item['target_name']}\n"
+        f"شو بدك تسمي «{item['label']}»؟\n"
+        "اكتب الاسم أو اختار الاسم الأصلي.",
         reply_markup=kb_status(),
     )
+
+
+def _upload_folder_snapshot(uid, display, folder_id):
+    root = USER_DRIVE.ensure_root(uid, display)
+    folder = USER_DRIVE.require_folder(uid, folder_id, display)
+    items, more = USER_DRIVE.list_children(uid, folder["id"], display)
+    return root, folder, [i for i in items if i.get("mimeType") == FOLDER_MIME], more
+
+
+async def _show_upload_folders(ctx, chat_id, item, folder_id=None, page=0, cq=None):
+    if not folder_id:
+        recent = await _drive_call(USER_DRIVE.current, item["uid"], item["owner_name"])
+        folder_id = recent["id"]
+    root, folder, folders, more = await _drive_call(
+        _upload_folder_snapshot, item["uid"], item["owner_name"], folder_id,
+    )
+    token = str(item["token"])
+    page_size = 6
+    last = max(0, (len(folders) - 1) // page_size)
+    page = max(0, min(page, last))
+    rows = []
+    for child in folders[page * page_size: (page + 1) * page_size]:
+        label = f"📁 {child['name'][:32]}"
+        rows.append([InlineKeyboardButton(
+            label, callback_data=f"upnav:{token}:{child['id']}",
+        )])
+    page_rows = []
+    if page:
+        page_rows.append(InlineKeyboardButton(
+            "⬅️ السابق", callback_data=f"uppage:{token}:{folder['id']}:{page - 1}",
+        ))
+    if page < last:
+        page_rows.append(InlineKeyboardButton(
+            "التالي ➡️", callback_data=f"uppage:{token}:{folder['id']}:{page + 1}",
+        ))
+    if page_rows:
+        rows.append(page_rows)
+    rows.append([InlineKeyboardButton(
+        "✅ حفظ بهالمجلد", callback_data=f"upset:{token}:{folder['id']}",
+    )])
+    rows.append([InlineKeyboardButton(
+        "➕ مجلد جديد هون", callback_data=f"upadd:{token}:{folder['id']}",
+    )])
+    nav = []
+    if folder["id"] != root["id"]:
+        parent_id = (folder.get("parents") or [root["id"]])[0]
+        nav.append(InlineKeyboardButton(
+            "⬅️ رجوع", callback_data=f"upnav:{token}:{parent_id}",
+        ))
+        nav.append(InlineKeyboardButton(
+            "🏠 مجلدي", callback_data=f"upnav:{token}:{root['id']}",
+        ))
+    if nav:
+        rows.append(nav)
+    title = (
+        f"وصل «{item['label']}».\n"
+        f"وين بدك تحفظه؟\n"
+        f"📁 {folder['name']}\n"
+        + ("اختار مجلد من تحت، أو احفظه هون." if folders else
+           "فيك تحفظه هون أو تعمل مجلد جديد.")
+        + ("\n(عم نعرض أول 1000 عنصر)" if more else "")
+    )
+    markup = InlineKeyboardMarkup(rows)
+    if cq is None:
+        await ctx.bot.send_message(chat_id, title, reply_markup=markup)
+    else:
+        try:
+            await cq.edit_message_text(title, reply_markup=markup)
+        except BadRequest as exc:
+            if "Message is not modified" not in str(exc):
+                await ctx.bot.send_message(chat_id, title, reply_markup=markup)
+
+
+async def _safe_callback_answer(cq, text=None, show_alert=False):
+    try:
+        await cq.answer(text=text, show_alert=show_alert)
+        return True
+    except BadRequest as exc:
+        if "query is too old" in str(exc).lower() or "query id is invalid" in str(exc).lower():
+            return False
+        raise
+    except (TimedOut, NetworkError):
+        return False
+
+
+async def _finish_queued_file(ctx, chat_id, user_data, chosen_name):
+    queue = user_data.get("queue", [])
+    if not queue or not queue[0].get("target_folder"):
+        return False
+    if await upload_item(ctx, chat_id, user_data, queue[0], chosen_name):
+        queue.pop(0)
+        return True
+    return False
+
+
+async def on_upload_folder_button(update, ctx):
+    cq = update.callback_query
+    if not await _safe_callback_answer(cq):
+        return
+    if not await _private_ui(update):
+        return
+    queue = ctx.user_data.get("queue", [])
+    if not queue:
+        await cq.message.reply_text("ما في ملف ناطر اختيار مجلد.")
+        return
+    item = queue[0]
+    parts = cq.data.split(":")
+    action, token = parts[0], parts[1]
+    if str(item["token"]) != token or item["uid"] != update.effective_user.id or item.get("target_folder"):
+        await cq.message.reply_text("هالزر قديم. ابعت الملف مرة تانية إذا لزم.")
+        return
+    uid, display = item["uid"], item["owner_name"]
+    if action == "uppage":
+        fid, page = parts[2], int(parts[3])
+        await _show_upload_folders(ctx, cq.message.chat_id, item, fid, page, cq)
+    elif action == "upnav":
+        await _show_upload_folders(ctx, cq.message.chat_id, item, parts[2], 0, cq)
+    elif action == "upset":
+        selected = await _drive_call(USER_DRIVE.require_folder, uid, parts[2], display)
+        item["target_folder"] = selected["id"]
+        item["target_name"] = selected["name"]
+        try:
+            await cq.edit_message_text(f"تمام، اخترت «{selected['name']}».")
+        except BadRequest:
+            pass
+        await ask_next(ctx, cq.message.chat_id, ctx.user_data)
+    elif action == "upadd":
+        await _drive_call(USER_DRIVE.require_folder, uid, parts[2], display)
+        ctx.user_data.pop("renaming", None)
+        ctx.user_data["creating_folder_in"] = parts[2]
+        ctx.user_data["creating_for_upload"] = token
+        await cq.message.reply_text("شو بدك تسمي المجلد الجديد؟")
 
 # ---------- upload ----------
 def _format_eta(seconds):
@@ -347,13 +482,26 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
         except Exception as exc:
             print(f"Upload counter update failed: {type(exc).__name__}")
         await _edit_upload_status(status_msg, "✅ اكتمل الرفع إلى Drive (100%)")
-        await ctx.bot.send_message(
-            chat_id, f"تم رفع «{name}» على Drive.",
-            reply_markup=kb_after_upload(result["id"]),
+        try:
+            await ctx.bot.send_message(
+                chat_id, f"انحفظ «{name}» بمجلد «{item['target_name']}».",
+                reply_markup=kb_after_upload(result["id"]),
+            )
+        except Exception:
+            traceback.print_exc()  # Upload succeeded even if notification failed.
+        return True
+    except Exception as exc:
+        traceback.print_exc()
+        if isinstance(exc, (TimedOut, NetworkError)):
+            notice = "اتصال Telegram تأخر. جرّب مرة تانية."
+        elif isinstance(exc, HttpError):
+            notice = "Drive ما ردّ هالمرة. جرّب بعد شوي."
+        else:
+            notice = "ما زبط الرفع هالمرة. جرّب مرة تانية."
+        await _edit_upload_status(
+            status_msg, f"{notice}\nالملف بعدها بالدور، ما بدك تبعته من جديد.",
         )
-    except Exception:
-        await _edit_upload_status(status_msg, f"ما اكتمل رفع «{name[:65]}». الملف بعدها بالدور؛ ابعت الاسم مرة تانية أو /skip.")
-        raise
+        return False
     finally:
         if tmp_path is not None:
             try:
@@ -363,13 +511,29 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
 
 
 # ---------- handlers ----------
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "أهلاً! ابعت ملفك هون وبحفظه بمجلدك على Drive.\n"
-        "ومن الأزرار تحت فيك ترتّب ملفاتك.",
-        reply_markup=_menu_keyboard(update.effective_user.id),
+def _welcome_text():
+    return (
+        "أهلاً فيك ببوت فريق Ctrl+Tea ☕\n\n"
+        "هون فيك تحفظ ملفاتك وفويسات المحاضرات على Google Drive، "
+        "وترتّبهن بمجلدات خاصة فيك.\n\n"
+        "طريقة الرفع:\n"
+        "1. ابعت الملف أو الفويس هون (مباشرة أو Forward).\n"
+        "2. اختار المجلد من الأزرار، أو اعمل مجلد جديد.\n"
+        "3. اكتب اسم للملف أو اختار «الاسم الأصلي».\n\n"
+        "رح تشوف تقدّم الرفع، وبخبرك لما ينحفظ الملف.\n"
+        "الفويس بينحفظ كملف صوتي بصيغته الأصلية؛ ما بيتحوّل لنص.\n\n"
+        "— فريق Ctrl+Tea"
     )
 
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        _welcome_text(), reply_markup=_menu_keyboard(update.effective_user.id),
+    )
+
+
+async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await start(update, ctx)
 
 async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     person = update.effective_user
@@ -398,6 +562,8 @@ async def folder(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     m = update.message
+    if not await _private_ui(update):
+        return
     ud = ctx.user_data
     att = m.effective_attachment
     if isinstance(att, (list, tuple)):  # photo -> biggest size
@@ -426,24 +592,28 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     u = m.from_user
-    base = os.path.splitext(orig)[0] if orig else "file"
-    target = await _drive_call(USER_DRIVE.current, u.id, u.full_name)
+    if orig:
+        default_name = clean(orig)
+    else:
+        prefix = "فويس" if m.voice else ("صوت" if m.audio else ("صورة" if m.photo else "ملف"))
+        default_name = f"{prefix}_{ts}_{m.message_id}{ext}"
     item = {
         "file_id": att.file_id,
         "owner_name": u.full_name,
-        "target_folder": target["id"],
-        "target_name": target["name"],
+        "token": str(m.message_id),
+        "target_folder": None,
+        "target_name": None,
         "uid": u.id,
         "mime": mime,
         "ext": ext,
         "label": orig or f"{kind} {m.message_id}",
-        "default_name": clean(f"{ts}_{u.username or u.id}_{m.message_id}_{base}{ext}"),
+        "default_name": default_name,
     }
     queue = ud.setdefault("queue", [])
     was_empty = not queue
     queue.append(item)
 
-    if was_empty and not ud.get("renaming"):
+    if was_empty:
         await ask_next(ctx, m.chat_id, ud)
     elif not m.media_group_id or ud.get("last_group") != m.media_group_id:
         ud["last_group"] = m.media_group_id
@@ -478,12 +648,32 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text == ADMIN_BTN:
         await admin(update, ctx)
         return
+    if text == HELP_BTN:
+        await help_command(update, ctx)
+        return
 
     if ud.get("creating_folder_in"):
         if not await _private_ui(update):
             return
-        await _create_and_select(update, ctx, ud["creating_folder_in"], text)
-        ud.pop("creating_folder_in", None)
+        parent = ud["creating_folder_in"]
+        token = ud.get("creating_for_upload")
+        if token:
+            queue = ud.get("queue", [])
+            if not queue or str(queue[0].get("token")) != token:
+                ud.pop("creating_for_upload", None)
+                ud.pop("creating_folder_in", None)
+                await update.message.reply_text("هالطلب انتهى. ابعت الملف من جديد.")
+                return
+            made = await _drive_call(USER_DRIVE.create_folder, person.id, parent, text, person.full_name)
+            queue[0]["target_folder"] = made["id"]
+            queue[0]["target_name"] = made["name"]
+            ud.pop("creating_for_upload", None)
+            ud.pop("creating_folder_in", None)
+            await update.message.reply_text(f"عملت مجلد «{made['name']}».")
+            await ask_next(ctx, chat_id, ud)
+        else:
+            await _create_and_select(update, ctx, parent, text)
+            ud.pop("creating_folder_in", None)
         return
 
     if ud.get("renaming"):
@@ -508,31 +698,36 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     queue = ud.get("queue", [])
     if not queue:
         return
-    await upload_item(ctx, chat_id, ud, queue[0], text)
-    queue.pop(0)
-    await ask_next(ctx, chat_id, ud)
+    if not queue[0].get("target_folder"):
+        await update.message.reply_text("اختار المجلد من الأزرار بالأول.")
+        return
+    if await _finish_queued_file(ctx, chat_id, ud, text):
+        await ask_next(ctx, chat_id, ud)
 
 async def skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ud = ctx.user_data
-    qd = ud.get("queue", [])
-    if not qd:
+    queue = ctx.user_data.get("queue", [])
+    if not queue:
         return
-    await upload_item(ctx, update.message.chat_id, ud, qd[0], None)
-    qd.pop(0)
-    await ask_next(ctx, update.message.chat_id, ud)
+    if not queue[0].get("target_folder"):
+        await update.message.reply_text("اختار المجلد بالأول.")
+        return
+    if await _finish_queued_file(ctx, update.effective_chat.id, ctx.user_data, None):
+        await ask_next(ctx, update.effective_chat.id, ctx.user_data)
 
 
 async def skipall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ud = ctx.user_data
-    qd = ud.get("queue", [])
-    while qd:
-        await upload_item(ctx, update.message.chat_id, ud, qd[0], None)
-        qd.pop(0)
-
+    queue = ctx.user_data.get("queue", [])
+    if not queue:
+        return
+    while queue and queue[0].get("target_folder"):
+        if not await _finish_queued_file(ctx, update.effective_chat.id, ctx.user_data, None):
+            return
+    await ask_next(ctx, update.effective_chat.id, ctx.user_data)
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
-    await cq.answer()
+    if not await _safe_callback_answer(cq):
+        return
     if cq.data == "status":
         person = update.effective_user
         active = await _drive_call(USER_DRIVE.current, person.id, person.full_name)
@@ -553,7 +748,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- per-user browser ----------
 def _menu_keyboard(uid=None):
-    rows = [[FILES_BTN, NEW_FOLDER_BTN], [UPLOAD_BTN, STATUS_BTN]]
+    rows = [[FILES_BTN, NEW_FOLDER_BTN], [UPLOAD_BTN, STATUS_BTN], [HELP_BTN]]
     if uid is not None and int(uid) in ADMIN_IDS:
         rows.append([ADMIN_BTN])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -691,7 +886,8 @@ async def _create_and_select(update, ctx, parent_id, text):
 
 async def on_browser_button(update, ctx):
     cq = update.callback_query
-    await cq.answer()
+    if not await _safe_callback_answer(cq):
+        return
     if not await _private_ui(update):
         return
     person = update.effective_user
@@ -746,16 +942,19 @@ async def on_browser_button(update, ctx):
         elif action in ("skipone", "skipall"):
             queue = ctx.user_data.get("queue", [])
             if not queue:
-                await cq.message.reply_text("ما في ملفات بانتظار اسم.")
+                await cq.message.reply_text("ما في ملف ناطر اسم.")
                 return
-            while queue:
-                await upload_item(ctx, cq.message.chat_id, ctx.user_data, queue[0], None)
-                queue.pop(0)
+            if not queue[0].get("target_folder"):
+                await cq.message.reply_text("اختار المجلد بالأول.")
+                return
+            while queue and queue[0].get("target_folder"):
+                if not await _finish_queued_file(ctx, cq.message.chat_id, ctx.user_data, None):
+                    return
                 if action == "skipone":
-                    await ask_next(ctx, cq.message.chat_id, ctx.user_data)
                     break
-    except (FolderAccessError, ValueError) as exc:
-        await cq.message.reply_text(f"❌ {exc}")
+            await ask_next(ctx, cq.message.chat_id, ctx.user_data)
+    except (FolderAccessError, ValueError):
+        await cq.message.reply_text("هالمجلد مو متاح. افتح «ملفاتي» وجرّب من جديد.")
     except HttpError as exc:
         if getattr(exc.resp, "status", None) == 404:
             await cq.message.reply_text("❌ الملف أو المجلد ما عاد موجود.")
@@ -863,9 +1062,10 @@ async def unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
     if cq.from_user.id not in ADMIN_IDS or cq.message.chat.type != "private":
-        await cq.answer("هالخيار للإدارة فقط.", show_alert=True)
+        await _safe_callback_answer(cq, "هالخيار للإدارة فقط.", True)
         return
-    await cq.answer()
+    if not await _safe_callback_answer(cq):
+        return
     parts = cq.data.split(":")
     action = parts[1]
 
@@ -914,23 +1114,26 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Log every handler error; show details to admins, generic message to users."""
+    """Keep traceback on Render; users and admins see a short, readable message."""
     err = ctx.error
     traceback.print_exception(type(err), err, err.__traceback__)
-    detail = f"❌ {type(err).__name__}: {err}"[:600]
     chat_id = update.effective_chat.id if isinstance(update, Update) and update.effective_chat else None
-    targets = set(ADMIN_IDS)
-    if chat_id and chat_id not in ADMIN_IDS:
-        try:
-            await ctx.bot.send_message(chat_id, "صار خطأ، جرّب مرة تانية.")
-        except Exception:
-            pass
-    for t in targets:
-        try:
-            await ctx.bot.send_message(t, detail)
-        except Exception:
-            pass
-
+    if not chat_id:
+        return
+    if isinstance(err, (TimedOut, NetworkError)):
+        message = "الاتصال تأخر شوي. جرّب مرة تانية."
+    elif isinstance(err, FolderAccessError):
+        message = "ما عندك صلاحية لهالمجلد."
+    elif isinstance(err, (BadRequest, ValueError)):
+        message = "هالطلب ما زبط. افتح القائمة وجرّب من جديد."
+    elif isinstance(err, HttpError):
+        message = "في مشكلة بالاتصال مع Drive. جرّب بعد شوي."
+    else:
+        message = "صار خلل بسيط. جرّب مرة تانية."
+    try:
+        await ctx.bot.send_message(chat_id, message)
+    except Exception:
+        pass
 
 if not ADMIN_IDS:
     print("WARNING: ADMIN_IDS not set -> no admin panel. Get your ID from @userinfobot")
@@ -971,12 +1174,14 @@ app.add_handler(CommandHandler("ban", ban))
 app.add_handler(CommandHandler("unban", unban))
 app.add_handler(CallbackQueryHandler(on_admin_button, pattern=r"^adm:"))
 app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("help", help_command))
 app.add_handler(CommandHandler("status", status))
 app.add_handler(CommandHandler("newfolder", newfolder))
 app.add_handler(CommandHandler("folder", folder))
 app.add_handler(CommandHandler("files", user_files))
 app.add_handler(CommandHandler("skip", skip))
 app.add_handler(CommandHandler("skipall", skipall))
+app.add_handler(CallbackQueryHandler(on_upload_folder_button, pattern=r"^(upnav:|upset:|uppage:|upadd:)"))
 app.add_handler(CallbackQueryHandler(on_browser_button, pattern=r"^(home$|nav:|page:|item:|choose:|add:|trash:|confirm:|cancel:|skipone$|skipall$)"))
 app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(status|ren:)"))
 app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(STATUS_BTN)}$"), status))
