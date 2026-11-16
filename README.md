@@ -7,7 +7,21 @@ Telegram bot saves any file sent to it into a Google Drive folder. Creates folde
 - `/skip` default name for current file, `/skipall` default names for all queued
 - Rename after upload (inline button)
 - Status: `/status` or the "📊 الحالة" button
-- `/newfolder <name>` create + switch Drive folder, `/folder` show link
+- Each Telegram user gets a separate managed Drive root folder (under the bot's existing main Drive folder)
+- Arabic reply keyboard: 📁 ملفاتي, ➕ مجلد جديد, 📤 رفع ملف, 📊 الحالة
+- Browse folders/files with inline buttons, select upload destination, create nested folders, rename, and move items to Google Drive Trash after confirmation
+- `/files` browse your managed files, `/newfolder <name>` create inside the selected folder and switch to it, `/folder` open the file browser
+- Selected upload folder is persisted in `drivebot.settings`, including across Render restarts
+- `/skip` and `/skipall` still work; file naming now also has inline buttons
+
+## User folder security and deletion
+- Every new folder and upload has app-private Google Drive `appProperties.tg_owner` metadata with the Telegram user ID. All browse, select, rename and trash operations re-check ownership and parent ancestry on Drive.
+- The main folder for each user cannot be deleted from the bot. Folder deletion is confirmed and moves the folder and its contents to Google Drive Trash (recoverable by the connected Google account).
+- Users operate through **private Telegram chats** for file management. Uploads from groups still use the sender's own selected folder.
+- **Important:** these are logically isolated folders within the **single Google Drive account connected to this bot**. This feature does not grant each user access to their own separate Google Drive account.
+- Older files uploaded before this feature remain unchanged in the legacy shared folder and are **not** automatically associated with a Telegram user. This avoids accidentally claiming another user's files.
+- The root and selected folders are persisted in the existing `drivebot.settings` table; no new environment variables or database tables are needed.
+- The file browsing menu displays up to the first 1,000 items per folder; large folders may require a future paging enhancement.
 
 ## Admin panel
 Set `ADMIN_IDS` (comma-separated Telegram IDs, get yours from @userinfobot).
