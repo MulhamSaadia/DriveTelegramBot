@@ -29,6 +29,7 @@ from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
     TypeHandler, ApplicationHandlerStop, ContextTypes, filters,
 )
+from telegram.error import NetworkError, TimedOut
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -223,21 +224,75 @@ async def _edit_upload_status(message, text, **kwargs):
         return False
 
 
+async def _get_telegram_file(bot, file_id, status_msg):
+    """A local Bot API server may need minutes to prepare a large Telegram file."""
+    for attempt in range(3):
+        started = time.monotonic()
+        task = asyncio.create_task(bot.get_file(
+            file_id, read_timeout=600, connect_timeout=30, pool_timeout=30,
+        ))
+        while not task.done():
+            await asyncio.wait({task}, timeout=12)
+            if not task.done():
+                elapsed = int(time.monotonic() - started)
+                await _edit_upload_status(
+                    status_msg,
+                    f"📥 عم جيب الملف من Telegram... مرّت {elapsed} ثانية.\n"
+                    "⏳ عم استنى تجهيز الملف؛ نسبة رفع Drive بتظهر بعده.",
+                )
+        try:
+            return await task
+        except (TimedOut, NetworkError) as exc:
+            print(f"Telegram get_file attempt {attempt + 1}/3 failed: {type(exc).__name__}", flush=True)
+            if attempt == 2:
+                raise
+            await _edit_upload_status(
+                status_msg, f"🔄 اتصال Telegram تأخر، عم جرّب مرة {attempt + 2} من 3...",
+            )
+            await asyncio.sleep(2 ** (attempt + 1))
+
+
+async def _download_telegram_file(tg_file, path, status_msg):
+    for attempt in range(3):
+        try:
+            await tg_file.download_to_drive(
+                path, read_timeout=600, connect_timeout=30, pool_timeout=30,
+            )
+            return
+        except (TimedOut, NetworkError) as exc:
+            print(f"Telegram download attempt {attempt + 1}/3 failed: {type(exc).__name__}", flush=True)
+            if attempt == 2:
+                raise
+            await _edit_upload_status(
+                status_msg, f"🔄 تنزيل الملف انقطع، عم جرّب مرة {attempt + 2} من 3...",
+            )
+            await asyncio.sleep(2 ** (attempt + 1))
+
+
 async def upload_item(ctx, chat_id, ud, item, chosen_name):
     name = with_ext(chosen_name, item["ext"]) if chosen_name else item["default_name"]
     status_msg = await ctx.bot.send_message(chat_id, f"📥 عم جهّز «{name[:65]}» من Telegram...")
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=item["ext"] or ".bin")
-    tmp.close()
+    tmp_path = None
     try:
-        tg_file = await ctx.bot.get_file(item["file_id"])
+        tg_file = await _get_telegram_file(ctx.bot, item["file_id"], status_msg)
         parent = await asyncio.to_thread(folder_id)
-        await tg_file.download_to_drive(tmp.name)  # disk, not RAM
-        total_bytes = os.path.getsize(tmp.name)
+        # With local Bot API, get_file() already returns a shared on-disk path.
+        # Reuse it instead of duplicating multi-GB files on Render's ephemeral disk.
+        local_path = tg_file.file_path
+        if BOT_API_URL and local_path and os.path.isabs(local_path) and os.path.isfile(local_path):
+            upload_path = local_path
+        else:
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=item["ext"] or ".bin")
+            tmp_path = tmp.name
+            tmp.close()
+            await _download_telegram_file(tg_file, tmp_path, status_msg)
+            upload_path = tmp_path
+        total_bytes = os.path.getsize(upload_path)
         state = {"uploaded": 0}  # One writer (upload thread), one reader (event loop).
 
         def _create():
             media = MediaFileUpload(
-                tmp.name, mimetype=item["mime"], resumable=True,
+                upload_path, mimetype=item["mime"], resumable=True,
                 chunksize=8 * 1024 * 1024,
             )
             request = drive.files().create(
@@ -275,13 +330,14 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
             reply_markup=kb_after_upload(result["id"]),
         )
     except Exception:
-        await _edit_upload_status(status_msg, f"❌ ما اكتمل رفع «{name[:65]}». جرّب مرة ثانية.")
+        await _edit_upload_status(status_msg, f"❌ ما اكتمل رفع «{name[:65]}». الملف لسه بالطابور؛ اكتب الاسم أو /skip لإعادة المحاولة.")
         raise
     finally:
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ---------- handlers ----------
@@ -378,8 +434,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     qd = ud.get("queue", [])
     if not qd:
         return
-    item = qd.pop(0)
+    item = qd[0]
     await upload_item(ctx, chat_id, ud, item, text)
+    qd.pop(0)
     await ask_next(ctx, chat_id, ud)
 
 
@@ -388,7 +445,8 @@ async def skip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     qd = ud.get("queue", [])
     if not qd:
         return
-    await upload_item(ctx, update.message.chat_id, ud, qd.pop(0), None)
+    await upload_item(ctx, update.message.chat_id, ud, qd[0], None)
+    qd.pop(0)
     await ask_next(ctx, update.message.chat_id, ud)
 
 
@@ -396,7 +454,8 @@ async def skipall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
     qd = ud.get("queue", [])
     while qd:
-        await upload_item(ctx, update.message.chat_id, ud, qd.pop(0), None)
+        await upload_item(ctx, update.message.chat_id, ud, qd[0], None)
+        qd.pop(0)
 
 
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
