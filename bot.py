@@ -46,6 +46,7 @@ STATUS_BTN = "📊 الحالة"
 FILES_BTN = "📁 ملفاتي"
 NEW_FOLDER_BTN = "➕ مجلد جديد"
 UPLOAD_BTN = "📤 رفع ملف"
+ADMIN_BTN = "🛡️ السوبر أدمن"
 # Optional: URL of a self-hosted Telegram Bot API server (run with --local) -> files up to 2GB.
 # Without it, Telegram's cloud Bot API limits downloads to 20MB.
 BOT_API_URL = os.environ.get("BOT_API_URL", "").rstrip("/")
@@ -174,7 +175,7 @@ def kb_status():
 def status_text(ud, folder_name=None):
     qd = ud.get("queue", [])
     up = ud.get("uploaded", [])
-    lines = [f"⏳ بالانتظار: {len(qd)}", f"✅ انرفع: {len(up)}"]
+    lines = [f"بالانتظار: {len(qd)}", f"تم الرفع بهالجلسة: {len(up)}"]
     if qd:
         lines.append(f"التالي: {qd[0]['label']}")
     if up:
@@ -185,17 +186,17 @@ def status_text(ud, folder_name=None):
 
 
 async def ask_next(ctx, chat_id, ud):
-    qd = ud.get("queue", [])
-    if not qd:
+    pending = ud.get("queue", [])
+    if not pending:
         return
+    item = pending[0]
     await ctx.bot.send_message(
         chat_id,
-        f"شو الاسم يلي بدك ياه للملف؟\n«{qd[0]['label']}» (بالانتظار: {len(qd)})\n"
-        f"📁 مكان الرفع: {qd[0].get('target_name', 'ملفاتي')}\n"
-        "/skip = اسم افتراضي · /skipall = الكل افتراضي",
+        f"وصل «{item['label']}».\nشو بدك تسميه؟\n"
+        f"مجلد الرفع: {item.get('target_name', 'ملفاتي')}\n"
+        "اكتب الاسم أو اختار من الأزرار.",
         reply_markup=kb_status(),
     )
-
 
 # ---------- upload ----------
 def _format_eta(seconds):
@@ -364,9 +365,9 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
 # ---------- handlers ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أهلاً! صار لكل مستخدم مجلد خاص داخل Google Drive تبع البوت.\n"
-        "📁 تصفح ملفاتك، ➕ أنشئ مجلد، أو ابعت أي ملف لرفعه.",
-        reply_markup=_menu_keyboard(),
+        "أهلاً! ابعت ملفك هون وبحفظه بمجلدك على Drive.\n"
+        "ومن الأزرار تحت فيك ترتّب ملفاتك.",
+        reply_markup=_menu_keyboard(update.effective_user.id),
     )
 
 
@@ -374,7 +375,7 @@ async def status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     person = update.effective_user
     active = await _drive_call(USER_DRIVE.current, person.id, person.full_name)
     await update.effective_message.reply_text(
-        status_text(ctx.user_data, active["name"]), reply_markup=_menu_keyboard(),
+        status_text(ctx.user_data, active["name"]), reply_markup=_menu_keyboard(person.id),
     )
 
 
@@ -446,7 +447,7 @@ async def on_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await ask_next(ctx, m.chat_id, ud)
     elif not m.media_group_id or ud.get("last_group") != m.media_group_id:
         ud["last_group"] = m.media_group_id
-        await m.reply_text(f"➕ انضاف للطابور (بالانتظار: {len(queue)})", reply_markup=kb_status())
+        await m.reply_text(f"تمام، صار عندك {len(queue)} ملفات بالدور.", reply_markup=kb_status())
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -474,6 +475,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text == STATUS_BTN:
         await status(update, ctx)
         return
+    if text == ADMIN_BTN:
+        await admin(update, ctx)
+        return
 
     if ud.get("creating_folder_in"):
         if not await _private_ui(update):
@@ -496,7 +500,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if x["id"] == fid:
                 x["name"] = renamed["name"]
         await update.message.reply_text(
-            f"✏️ الاسم الجديد: {renamed['name']}", reply_markup=_menu_keyboard(),
+            f"تغيّر الاسم لـ «{renamed['name']}».", reply_markup=_menu_keyboard(person.id),
         )
         await ask_next(ctx, chat_id, ud)
         return
@@ -548,11 +552,11 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- per-user browser ----------
-def _menu_keyboard():
-    return ReplyKeyboardMarkup(
-        [[FILES_BTN, NEW_FOLDER_BTN], [UPLOAD_BTN, STATUS_BTN]], resize_keyboard=True,
-    )
-
+def _menu_keyboard(uid=None):
+    rows = [[FILES_BTN, NEW_FOLDER_BTN], [UPLOAD_BTN, STATUS_BTN]]
+    if uid is not None and int(uid) in ADMIN_IDS:
+        rows.append([ADMIN_BTN])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 async def _drive_call(fn, *args):
     async with DRIVE_LOCK:
@@ -562,7 +566,7 @@ async def _drive_call(fn, *args):
 async def _private_ui(update):
     if update.effective_chat.type == "private":
         return True
-    await update.effective_message.reply_text("🔒 لإدارة ملفاتك افتح محادثة خاصة مع البوت.")
+    await update.effective_message.reply_text("افتح الخاص مع البوت لتدير ملفاتك.")
     return False
 
 
@@ -671,7 +675,7 @@ async def upload_help(update, ctx):
     active = await _drive_call(USER_DRIVE.current, person.id, person.full_name)
     await update.effective_message.reply_text(
         f"📤 ابعت الملف هون، ورح يروح على «{active['name']}».\n"
-        "لتغيير المكان اضغط 📁 ملفاتي.", reply_markup=_menu_keyboard(),
+        "إذا بدك تغيّر المجلد، افتح «ملفاتي».", reply_markup=_menu_keyboard(person.id),
     )
 
 
@@ -782,23 +786,25 @@ async def gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if rec["is_new"]:
         for aid in ADMIN_IDS:
             await ctx.bot.send_message(
-                aid, f"👤 مستخدم جديد: {label(rec)} ({u.id}) — {rec['status']}",
+                aid, f"مستخدم جديد: {label(rec)} ({u.id})\nالحالة: {rec['status']}",
                 reply_markup=InlineKeyboardMarkup([[user_button(rec)]]),
             )
     if rec["status"] == "banned":
         raise ApplicationHandlerStop
     if rec["status"] == "pending":
         if update.effective_chat:
-            await ctx.bot.send_message(update.effective_chat.id, "⏳ بانتظار موافقة الأدمن.")
+            await ctx.bot.send_message(update.effective_chat.id, "طلبك ناطر موافقة الإدارة.")
         raise ApplicationHandlerStop
 
 
 def panel_markup():
-    mode = "ON" if get_setting("approval_mode", "false") == "true" else "OFF"
+    approval = get_setting("approval_mode", "false") == "true"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 المستخدمين", callback_data="adm:list"),
-         InlineKeyboardButton("📈 إحصائيات", callback_data="adm:stats")],
-        [InlineKeyboardButton(f"🔐 وضع الموافقة: {mode}", callback_data="adm:mode")],
+        [InlineKeyboardButton("⏳ طلبات الموافقة", callback_data="adm:pending"),
+         InlineKeyboardButton("👥 المستخدمين", callback_data="adm:list")],
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data="adm:stats"),
+         InlineKeyboardButton(f"الموافقة: {'مفعّلة' if approval else 'متوقفة'}", callback_data="adm:mode")],
+        [InlineKeyboardButton("🏠 الرئيسية", callback_data="adm:home")],
     ])
 
 
@@ -807,76 +813,104 @@ def stats_text():
         "select status, count(*) as c, coalesce(sum(uploads), 0) as up from drivebot.users group by status",
         fetch="all",
     )
-    by = {r["status"]: r["c"] for r in rows}
-    total = sum(by.values())
+    by = {r["status"]: int(r["c"]) for r in rows}
     uploads = sum(int(r["up"]) for r in rows)
-    on = get_setting("approval_mode", "false") == "true"
+    approval = get_setting("approval_mode", "false") == "true"
     return (
-        "🛠 لوحة الأدمن\n"
-        f"👥 المستخدمين: {total}\n"
-        f"✅ فعّال: {by.get('active', 0)} · ⏳ منتظر: {by.get('pending', 0)} · 🚫 محظور: {by.get('banned', 0)}\n"
-        f"📤 مجموع الرفع: {uploads}\n"
-        f"🔐 وضع الموافقة: {'ON (المستخدم الجديد لازم تقبلو)' if on else 'OFF'}\n"
-        f"📁 {folder_url()}"
+        "🛡️ لوحة السوبر أدمن\n\n"
+        f"المستخدمين: {sum(by.values())}\n"
+        f"الفعّالين: {by.get('active', 0)} | بانتظار الموافقة: {by.get('pending', 0)}\n"
+        f"المحظورين: {by.get('banned', 0)}\n"
+        f"الملفات المرفوعة: {uploads}\n"
+        f"الموافقة على الأعضاء الجدد: {'مفعّلة' if approval else 'متوقفة'}"
     )
 
 
 async def admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
+        await update.effective_message.reply_text("هالخيار للإدارة فقط.")
         return
-    await update.message.reply_text(stats_text(), reply_markup=panel_markup())
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text("افتح الخاص مع البوت لتدخل لوحة الإدارة.")
+        return
+    await update.effective_message.reply_text(stats_text(), reply_markup=panel_markup())
 
 
 async def ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update) or not ctx.args or not ctx.args[0].isdigit():
+    if not is_admin(update) or update.effective_chat.type != "private":
+        return
+    if not ctx.args or not ctx.args[0].isdigit():
+        await update.message.reply_text("استخدم /ban وبعده رقم المستخدم.")
+        return
+    if int(ctx.args[0]) in ADMIN_IDS:
+        await update.message.reply_text("ما فيك تحظر أدمن من هون.")
         return
     rec = set_status(ctx.args[0], "banned")
-    await update.message.reply_text(f"🚫 {label(rec)}" if rec else "ما لقيت هالـ ID")
+    await update.message.reply_text(f"انحظر {label(rec)}." if rec else "ما لقيت هالمستخدم.")
 
 
 async def unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update) or not ctx.args or not ctx.args[0].isdigit():
+    if not is_admin(update) or update.effective_chat.type != "private":
+        return
+    if not ctx.args or not ctx.args[0].isdigit():
+        await update.message.reply_text("استخدم /unban وبعده رقم المستخدم.")
         return
     rec = set_status(ctx.args[0], "active")
-    await update.message.reply_text(f"♻️ {label(rec)}" if rec else "ما لقيت هالـ ID")
+    await update.message.reply_text(f"انفك الحظر عن {label(rec)}." if rec else "ما لقيت هالمستخدم.")
 
 
 async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cq = update.callback_query
-    if cq.from_user.id not in ADMIN_IDS:
-        await cq.answer("مو أدمن", show_alert=True)
+    if cq.from_user.id not in ADMIN_IDS or cq.message.chat.type != "private":
+        await cq.answer("هالخيار للإدارة فقط.", show_alert=True)
         return
     await cq.answer()
     parts = cq.data.split(":")
     action = parts[1]
 
     if action == "set":
-        rec = set_status(parts[2], parts[3])
+        if len(parts) != 4 or parts[3] not in ("active", "banned") or not parts[2].isdigit():
+            return
+        uid = int(parts[2])
+        if uid in ADMIN_IDS:
+            await cq.message.reply_text("ما فيك تغيّر صلاحية أدمن من هون.")
+            return
+        rec = set_status(uid, parts[3])
         if rec:
+            message = "انحظر حسابك من البوت." if parts[3] == "banned" else "صار فيك تستخدم البوت."
             try:
-                await ctx.bot.send_message(rec["id"], "🚫 انحظرت." if parts[3] == "banned" else "✅ تم السماح لك.")
+                await ctx.bot.send_message(uid, message)
             except Exception:
                 pass
         action = "list"
     elif action == "mode":
-        on = get_setting("approval_mode", "false") == "true"
-        set_setting("approval_mode", "false" if on else "true")
+        enabled = get_setting("approval_mode", "false") == "true"
+        set_setting("approval_mode", "false" if enabled else "true")
         await cq.edit_message_text(stats_text(), reply_markup=panel_markup())
         return
 
-    if action == "stats":
+    if action in ("home", "stats"):
         await cq.edit_message_text(stats_text(), reply_markup=panel_markup())
-    elif action == "list":
-        recs = q("select * from drivebot.users order by last_seen desc limit 15", fetch="all")
-        icon = {"active": "✅", "pending": "⏳", "banned": "🚫"}
+    elif action in ("list", "pending"):
+        if action == "pending":
+            users = q(
+                "select * from drivebot.users where status='pending' order by last_seen desc limit 15",
+                fetch="all",
+            )
+        else:
+            users = q("select * from drivebot.users order by last_seen desc limit 15", fetch="all")
+        icons = {"active": "✅", "pending": "⏳", "banned": "🚫"}
         lines = [
-            f"{icon[r['status']]} {label(r)} · {r['id']} · رفع: {r['uploads']} · آخر ظهور: {r['last_seen']:%Y-%m-%d %H:%M}"
-            for r in recs
-        ] or ["ما في مستخدمين بعد."]
-        rows = [[user_button(r)] for r in recs]
-        rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="adm:stats")])
-        await cq.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
-
+            f"{icons.get(r['status'], '•')} {label(r)} | {r['id']} | رفع: {r['uploads']}"
+            for r in users
+        ]
+        heading = "⏳ طلبات الموافقة" if action == "pending" else "👥 آخر 15 مستخدم"
+        buttons = [[user_button(r)] for r in users]
+        buttons.append([InlineKeyboardButton("⬅️ رجوع", callback_data="adm:home")])
+        await cq.edit_message_text(
+            heading + "\n\n" + ("\n".join(lines) if lines else "ما في طلبات حالياً."),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
 
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     """Log every handler error; show details to admins, generic message to users."""
@@ -887,7 +921,7 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     targets = set(ADMIN_IDS)
     if chat_id and chat_id not in ADMIN_IDS:
         try:
-            await ctx.bot.send_message(chat_id, "❌ صار خطأ، جرّب مرة ثانية.")
+            await ctx.bot.send_message(chat_id, "صار خطأ، جرّب مرة تانية.")
         except Exception:
             pass
     for t in targets:
@@ -931,6 +965,7 @@ app = builder.build()
 app.add_error_handler(on_error)
 app.add_handler(TypeHandler(Update, gate), group=-1)
 app.add_handler(CommandHandler("admin", admin))
+app.add_handler(CommandHandler("superadmin", admin))
 app.add_handler(CommandHandler("ban", ban))
 app.add_handler(CommandHandler("unban", unban))
 app.add_handler(CallbackQueryHandler(on_admin_button, pattern=r"^adm:"))
