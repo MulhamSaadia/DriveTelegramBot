@@ -159,6 +159,69 @@ class UserDrive:
         files.sort(key=lambda f: (f.get("mimeType") != FOLDER_MIME, f.get("name", "").casefold()))
         return files, bool(response.get("nextPageToken"))
 
+
+    def ensure_defaults(self, uid, display_name):
+        """Create three useful folders once without moving any existing files."""
+        key = self._key(uid, "defaults_ready")
+        if self.get_setting(key) == "v1":
+            return
+        root = self.ensure_root(uid, display_name)
+        existing, _ = self.list_children(uid, root["id"], display_name)
+        names = {f["name"].casefold() for f in existing if f.get("mimeType") == FOLDER_MIME}
+        for name in ("محاضرات", "فويسات", "ملفات عامة"):
+            if name.casefold() not in names:
+                self.create_folder(uid, root["id"], name, display_name)
+        self.set_setting(key, "v1")
+
+    def _find_owned_files(self, uid, display_name, phrase=None, limit=12):
+        """Return only files verified to be in the Telegram user's Drive tree."""
+        uid = int(uid)
+        root = self.ensure_root(uid, display_name)
+        query = (
+            f"trashed = false and mimeType != '{FOLDER_MIME}' and "
+            f"appProperties has {{ key='{OWNER_KEY}' and value='{uid}' }}"
+        )
+        if phrase is not None:
+            phrase = str(phrase).strip()[:80]
+            if len(phrase) < 2:
+                raise ValueError("اكتب حرفين على الأقل للبحث.")
+            escaped = phrase.replace("\\", "\\\\").replace("'", "\\'")
+            query += f" and name contains '{escaped}'"
+        found = []
+        next_page = None
+        scanned = 0
+        while len(found) < limit and scanned < 250:
+            response = self.drive.files().list(
+                q=query, fields=f"nextPageToken,files({META_FIELDS})",
+                pageSize=100, orderBy="createdTime desc", pageToken=next_page,
+            ).execute()
+            for item in response.get("files", []):
+                scanned += 1
+                if not self._owned(item, uid):
+                    continue
+                # Do not trust labels alone; a file may have been moved by Drive.
+                try:
+                    self.require_item(uid, item["id"], display_name)
+                except FolderAccessError:
+                    continue
+                except HttpError as exc:
+                    if _is_missing(exc):
+                        continue
+                    raise
+                found.append(item)
+                if len(found) == limit:
+                    break
+            next_page = response.get("nextPageToken")
+            if not next_page:
+                break
+        return found
+
+    def recent_files(self, uid, display_name):
+        return self._find_owned_files(uid, display_name, limit=10)
+
+    def search_files(self, uid, display_name, phrase):
+        return self._find_owned_files(uid, display_name, phrase=phrase, limit=12)
+
     def rename(self, uid, item_id, new_name, display_name):
         meta = self.require_item(uid, item_id, display_name)
         if (meta.get("appProperties") or {}).get(ROLE_KEY) == "root":
