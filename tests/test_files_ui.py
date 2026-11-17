@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MODULES = {
     "bot.py": {
         "drive_file_url", "show_item", "_show_file_results", "_menu_keyboard",
-        "_upload_folder_snapshot", "show_browser", "_show_upload_folders",
+        "_upload_folder_snapshot", "_browser_snapshot", "show_browser", "_show_upload_folders",
     },
 }
 
