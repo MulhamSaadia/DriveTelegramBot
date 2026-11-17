@@ -229,14 +229,13 @@ async def ask_next(ctx, chat_id, ud):
 
 def _upload_folder_snapshot(uid, display, folder_id):
     USER_DRIVE.ensure_defaults(uid, display)
-    root = USER_DRIVE.ensure_root(uid, display)
-    folder = USER_DRIVE.require_folder(uid, folder_id, display)
+    root, folder, breadcrumbs = USER_DRIVE.folder_path(uid, folder_id, display)
     items, more = USER_DRIVE.list_children(uid, folder["id"], display)
     folders = [i for i in items if i.get("mimeType") == FOLDER_MIME]
+    files = [i for i in items if i.get("mimeType") != FOLDER_MIME]
     preferred = {"فويسات": 0, "محاضرات": 1, "ملفات عامة": 2}
     folders.sort(key=lambda f: (preferred.get(f["name"], 9), f["name"].casefold()))
-    return root, folder, folders, more
-
+    return root, folder, folders, files, more, breadcrumbs
 
 async def _show_upload_folders(ctx, chat_id, item, folder_id=None, page=0, cq=None):
     if not folder_id:
@@ -244,46 +243,16 @@ async def _show_upload_folders(ctx, chat_id, item, folder_id=None, page=0, cq=No
         root_folder = await _drive_call(USER_DRIVE.ensure_root, item["uid"], item["owner_name"])
         item["recent_target"] = recent
         folder_id = root_folder["id"]
-    root, folder, folders, more = await _drive_call(
+    root, folder, folders, files, more, breadcrumbs = await _drive_call(
         _upload_folder_snapshot, item["uid"], item["owner_name"], folder_id,
     )
     token = str(item["token"])
-    page_size = 6
-    last = max(0, (len(folders) - 1) // page_size)
-    page = max(0, min(page, last))
+    contents = [("folder", f) for f in folders] + [("file", f) for f in files]
+    page_size = 7
+    last = max(0, (len(contents) - 1) // page_size)
+    page = max(0, min(int(page), last))
     rows = []
-    quick = item.get("recent_target")
-    if quick and quick["id"] != folder["id"]:
-        rows.append([InlineKeyboardButton(
-            f"📍 آخر مجلد: {quick['name'][:26]}",
-            callback_data=f"upset:{token}:{quick['id']}",
-        )])
-    for child in folders[page * page_size: (page + 1) * page_size]:
-        rows.append([
-            InlineKeyboardButton(
-                f"📂 {child['name'][:26]}", callback_data=f"upnav:{token}:{child['id']}",
-            ),
-            InlineKeyboardButton(
-                "✅ اختار", callback_data=f"upset:{token}:{child['id']}",
-            ),
-        ])
-    page_rows = []
-    if page:
-        page_rows.append(InlineKeyboardButton(
-            "⬅️ السابق", callback_data=f"uppage:{token}:{folder['id']}:{page - 1}",
-        ))
-    if page < last:
-        page_rows.append(InlineKeyboardButton(
-            "التالي ➡️", callback_data=f"uppage:{token}:{folder['id']}:{page + 1}",
-        ))
-    if page_rows:
-        rows.append(page_rows)
-    rows.append([InlineKeyboardButton(
-        "✅ حفظ بهالمجلد", callback_data=f"upset:{token}:{folder['id']}",
-    )])
-    rows.append([InlineKeyboardButton(
-        "➕ مجلد جديد هون", callback_data=f"upadd:{token}:{folder['id']}",
-    )])
+
     nav = []
     if folder["id"] != root["id"]:
         parent_id = (folder.get("parents") or [root["id"]])[0]
@@ -291,16 +260,62 @@ async def _show_upload_folders(ctx, chat_id, item, folder_id=None, page=0, cq=No
             "⬅️ رجوع", callback_data=f"upnav:{token}:{parent_id}",
         ))
         nav.append(InlineKeyboardButton(
-            "🏠 مجلدي", callback_data=f"upnav:{token}:{root['id']}",
+            "🏠 الرئيسية", callback_data=f"upnav:{token}:{root['id']}",
         ))
     if nav:
         rows.append(nav)
+
+    quick = item.get("recent_target")
+    if quick and quick["id"] != folder["id"]:
+        rows.append([InlineKeyboardButton(
+            f"📍 آخر مجلد: {quick['name'][:26]}",
+            callback_data=f"upset:{token}:{quick['id']}",
+        )])
+
+    for kind, child in contents[page * page_size: (page + 1) * page_size]:
+        if kind == "folder":
+            rows.append([
+                InlineKeyboardButton(
+                    f"📂 {child['name'][:29]}", callback_data=f"upnav:{token}:{child['id']}",
+                ),
+                InlineKeyboardButton(
+                    "✅ اختار", callback_data=f"upset:{token}:{child['id']}",
+                ),
+            ])
+        else:
+            rows.append([InlineKeyboardButton(
+                f"📄 {child.get('name', 'ملف')[:38]}",
+                url=drive_file_url(child["id"]),
+            )])
+
+    pager = []
+    if page:
+        pager.append(InlineKeyboardButton(
+            "⬅️ السابق", callback_data=f"uppage:{token}:{folder['id']}:{page - 1}",
+        ))
+    if page < last:
+        pager.append(InlineKeyboardButton(
+            "التالي ➡️", callback_data=f"uppage:{token}:{folder['id']}:{page + 1}",
+        ))
+    if pager:
+        rows.append(pager)
+
+    rows.append([InlineKeyboardButton(
+        "✅ احفظ الملف هون", callback_data=f"upset:{token}:{folder['id']}",
+    )])
+    rows.append([InlineKeyboardButton(
+        "➕ مجلد جديد هون", callback_data=f"upadd:{token}:{folder['id']}",
+    )])
+
+    path = " / ".join(breadcrumbs)
+    if len(path) > 130:
+        path = "… / " + " / ".join(breadcrumbs[-3:])
     title = (
-        f"وصل «{item['label']}».\n"
-        f"وين بدك تحفظه؟\n"
-        f"📁 {folder['name']}\n"
-        + ("اختار مجلد من تحت، أو احفظه هون." if folders else
-           "فيك تحفظه هون أو تعمل مجلد جديد.")
+        f"وين بدك تحفظ «{item['label']}»؟\n"
+        f"📍 {path}\n"
+        f"📂 مجلدات: {len(folders)} | 📄 ملفات: {len(files)}\n\n"
+        + ("اضغط على مجلد لتشوف محتواه، أو اختار مكان الرفع."
+           if contents else "المجلد فاضي. فيك تحفظ هون أو تعمل مجلد جديد.")
         + ("\n(عم نعرض أول 1000 عنصر)" if more else "")
     )
     markup = InlineKeyboardMarkup(rows)
@@ -312,7 +327,6 @@ async def _show_upload_folders(ctx, chat_id, item, folder_id=None, page=0, cq=No
         except BadRequest as exc:
             if "Message is not modified" not in str(exc):
                 await ctx.bot.send_message(chat_id, title, reply_markup=markup)
-
 
 async def _safe_callback_answer(cq, text=None, show_alert=False):
     try:
@@ -836,10 +850,12 @@ async def _private_ui(update):
 def _browser_snapshot(uid, display, folder_id):
     USER_DRIVE.ensure_defaults(uid, display)
     root = USER_DRIVE.ensure_root(uid, display)
-    folder = USER_DRIVE.require_folder(uid, folder_id or root["id"], display)
+    root, folder, breadcrumbs = USER_DRIVE.folder_path(
+        uid, folder_id or root["id"], display,
+    )
     active = USER_DRIVE.current(uid, display)
     items, more = USER_DRIVE.list_children(uid, folder["id"], display)
-    return root, folder, active, items, more
+    return root, folder, active, items, more, breadcrumbs
 
 
 def _item_button(label, verb, file_id):
@@ -850,54 +866,82 @@ def _item_button(label, verb, file_id):
 
 
 async def show_browser(update, ctx, folder_id=None, page=0):
+    """Render the contents of one Drive folder inside a single Telegram message."""
     if not await _private_ui(update):
         return
     person = update.effective_user
-    root, folder, current, items, more = await _drive_call(
+    root, folder, current, items, more, breadcrumbs = await _drive_call(
         _browser_snapshot, person.id, person.full_name, folder_id,
     )
     limit = 8
-    pages = max(0, (len(items) - 1) // limit)
-    page = max(0, min(int(page), pages))
+    total_pages = max(0, (len(items) - 1) // limit)
+    page = max(0, min(int(page), total_pages))
     rows = []
-    for item in items[page * limit:(page + 1) * limit]:
-        is_folder = item.get("mimeType") == FOLDER_MIME
-        btn = _item_button(
-            ("📁 " if is_folder else "📄 ") + item.get("name", "ملف")[:36],
-            "nav" if is_folder else "item", item["id"],
+
+    # Keep navigation at the top so it is always easy to go up a level.
+    if folder["id"] != root["id"]:
+        parent_id = (folder.get("parents") or [root["id"]])[0]
+        rows.append([
+            InlineKeyboardButton("⬅️ رجوع", callback_data=f"nav:{parent_id}"),
+            InlineKeyboardButton("🏠 الرئيسية", callback_data="home"),
+        ])
+
+    # Every folder is a button. On tap, replace this message with its contents.
+    # Every file has a detail button plus a direct Drive link.
+    for meta in items[page * limit: (page + 1) * limit]:
+        is_folder = meta.get("mimeType") == FOLDER_MIME
+        entry = _item_button(
+            ("📂 " if is_folder else "📄 ") + meta.get("name", "ملف")[:33],
+            "nav" if is_folder else "item", meta["id"],
         )
-        if btn:
-            rows.append([btn])
+        if entry:
+            if is_folder:
+                rows.append([entry])
+            else:
+                rows.append([
+                    entry, InlineKeyboardButton("🔗", url=drive_file_url(meta["id"])),
+                ])
+
     pager = []
     if page:
-        pager.append(InlineKeyboardButton("⬅️ السابق", callback_data=f"page:{folder['id']}:{page-1}"))
-    if page < pages:
-        pager.append(InlineKeyboardButton("التالي ➡️", callback_data=f"page:{folder['id']}:{page+1}"))
+        pager.append(InlineKeyboardButton(
+            "⬅️ السابق", callback_data=f"page:{folder['id']}:{page-1}",
+        ))
+    if page < total_pages:
+        pager.append(InlineKeyboardButton(
+            "التالي ➡️", callback_data=f"page:{folder['id']}:{page+1}",
+        ))
     if pager:
         rows.append(pager)
+
     rows.append([
-        InlineKeyboardButton("✅ خلي الرفع هون", callback_data=f"choose:{folder['id']}"),
         InlineKeyboardButton("➕ مجلد جديد", callback_data=f"add:{folder['id']}"),
+        InlineKeyboardButton("📌 الرفع هون", callback_data=f"choose:{folder['id']}"),
     ])
-    rows.append([InlineKeyboardButton("🕘 آخر ملفاتي", callback_data="recent"),
-                 InlineKeyboardButton("🔎 بحث عن ملف", callback_data="findprompt")])
-    controls = [InlineKeyboardButton("🔄 تحديث", callback_data=f"nav:{folder['id']}")]
+    rows.append([
+        InlineKeyboardButton("🕘 آخر الملفات", callback_data="recent"),
+        InlineKeyboardButton("🔎 بحث", callback_data="findprompt"),
+    ])
+    rows.append([InlineKeyboardButton(
+        "🔄 تحديث المحتوى", callback_data=f"nav:{folder['id']}",
+    )])
     if folder["id"] != root["id"]:
-        parent = (folder.get("parents") or [root["id"]])[0]
-        controls.append(InlineKeyboardButton("⬅️ رجوع", callback_data=f"nav:{parent}"))
-        deletion = _item_button("🗑 حذف هذا المجلد", "trash", folder["id"])
+        deletion = _item_button("🗑 حذف هالمجلد", "trash", folder["id"])
         if deletion:
             rows.append([deletion])
-    else:
-        controls.append(InlineKeyboardButton("🏠 مجلدي", callback_data="home"))
-    rows.append(controls)
-    folder_count = sum(i.get("mimeType") == FOLDER_MIME for i in items)
+
+    path = " / ".join(breadcrumbs)
+    if len(path) > 130:
+        path = "… / " + " / ".join(breadcrumbs[-3:])
+    folder_count = sum(meta.get("mimeType") == FOLDER_MIME for meta in items)
     file_count = len(items) - folder_count
     summary = (
-        f"📁 {folder.get('name', 'ملفاتي')}\n"
-        f"مجلدات: {folder_count}   |   ملفات: {file_count}\n"
-        f"مكان الرفع الحالي: {current.get('name', '')}\n\n" +
-        ("اختار مجلد، أو افتح ملف لتلاقي رابطه." if items else "المجلد فاضي. ابعت ملف أو اعمل مجلد.")
+        f"📍 {path}\n"
+        f"📂 {folder_count} مجلدات  |  📄 {file_count} ملفات\n"
+        f"📌 مكان الرفع: {current.get('name', '')}\n\n"
+        + ("اضغط على المجلد لتشوف اللي جواه، أو على الملف لتاخد رابطه."
+           if items else "المجلد فاضي. ابعت ملف أو اعمل مجلد جديد.")
+        + (f"\nصفحة {page + 1} من {total_pages + 1}" if total_pages else "")
         + ("\n(في عناصر إضافية ما ظهرت بالقائمة)" if more else "")
     )
     markup = InlineKeyboardMarkup(rows)
@@ -909,7 +953,6 @@ async def show_browser(update, ctx, folder_id=None, page=0):
                 await update.effective_message.reply_text(summary, reply_markup=markup)
     else:
         await update.effective_message.reply_text(summary, reply_markup=markup)
-
 
 async def show_item(update, ctx, file_id):
     if not await _private_ui(update):
