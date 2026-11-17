@@ -259,10 +259,14 @@ async def _show_upload_folders(ctx, chat_id, item, folder_id=None, page=0, cq=No
             callback_data=f"upset:{token}:{quick['id']}",
         )])
     for child in folders[page * page_size: (page + 1) * page_size]:
-        label = f"📁 {child['name'][:32]}"
-        rows.append([InlineKeyboardButton(
-            label, callback_data=f"upnav:{token}:{child['id']}",
-        )])
+        rows.append([
+            InlineKeyboardButton(
+                f"📂 {child['name'][:26]}", callback_data=f"upnav:{token}:{child['id']}",
+            ),
+            InlineKeyboardButton(
+                "✅ اختار", callback_data=f"upset:{token}:{child['id']}",
+            ),
+        ])
     page_rows = []
     if page:
         page_rows.append(InlineKeyboardButton(
