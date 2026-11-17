@@ -155,8 +155,14 @@ def with_ext(name, ext):
 
 
 # ---------- UI helpers ----------
+def drive_file_url(file_id):
+    """Link to the exact Google Drive file; does not change sharing permissions."""
+    return f"https://drive.google.com/file/d/{file_id}/view"
+
+
 def kb_after_upload(file_id):
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 فتح الملف", url=drive_file_url(file_id))],
         [InlineKeyboardButton("✏️ غيّر الاسم", callback_data=f"ren:{file_id}"),
          InlineKeyboardButton("🗑 حذف", callback_data=f"trash:{file_id}")],
         [InlineKeyboardButton(FILES_BTN, callback_data="home"),
@@ -483,7 +489,11 @@ async def upload_item(ctx, chat_id, ud, item, chosen_name):
         await _edit_upload_status(status_msg, "✅ اكتمل الرفع إلى Drive (100%)")
         try:
             await ctx.bot.send_message(
-                chat_id, f"انحفظ «{name}» بمجلد «{item['target_name']}».",
+                chat_id,
+                f"✅ انحفظ الملف على Google Drive\n"
+                f"📄 {name}\n"
+                f"📁 المجلد: {item['target_name']}\n"
+                f"🔗 {drive_file_url(result['id'])}",
                 reply_markup=kb_after_upload(result["id"]),
             )
         except Exception:
