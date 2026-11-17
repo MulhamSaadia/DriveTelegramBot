@@ -204,6 +204,7 @@ def status_text(ud, folder_name=None):
         lines.append(f"التالي: {qd[0]['label']}")
     if up:
         lines.append(f"آخر ملف: {up[-1]['name']}")
+        lines.append(drive_file_url(up[-1]["id"]))
     if folder_name:
         lines.append(f"📁 مكان الرفع: {folder_name}")
     return "\n".join(lines)
@@ -227,16 +228,22 @@ async def ask_next(ctx, chat_id, ud):
 
 
 def _upload_folder_snapshot(uid, display, folder_id):
+    USER_DRIVE.ensure_defaults(uid, display)
     root = USER_DRIVE.ensure_root(uid, display)
     folder = USER_DRIVE.require_folder(uid, folder_id, display)
     items, more = USER_DRIVE.list_children(uid, folder["id"], display)
-    return root, folder, [i for i in items if i.get("mimeType") == FOLDER_MIME], more
+    folders = [i for i in items if i.get("mimeType") == FOLDER_MIME]
+    preferred = {"فويسات": 0, "محاضرات": 1, "ملفات عامة": 2}
+    folders.sort(key=lambda f: (preferred.get(f["name"], 9), f["name"].casefold()))
+    return root, folder, folders, more
 
 
 async def _show_upload_folders(ctx, chat_id, item, folder_id=None, page=0, cq=None):
     if not folder_id:
         recent = await _drive_call(USER_DRIVE.current, item["uid"], item["owner_name"])
-        folder_id = recent["id"]
+        root_folder = await _drive_call(USER_DRIVE.ensure_root, item["uid"], item["owner_name"])
+        item["recent_target"] = recent
+        folder_id = root_folder["id"]
     root, folder, folders, more = await _drive_call(
         _upload_folder_snapshot, item["uid"], item["owner_name"], folder_id,
     )
@@ -245,6 +252,12 @@ async def _show_upload_folders(ctx, chat_id, item, folder_id=None, page=0, cq=No
     last = max(0, (len(folders) - 1) // page_size)
     page = max(0, min(page, last))
     rows = []
+    quick = item.get("recent_target")
+    if quick and quick["id"] != folder["id"]:
+        rows.append([InlineKeyboardButton(
+            f"📍 آخر مجلد: {quick['name'][:26]}",
+            callback_data=f"upset:{token}:{quick['id']}",
+        )])
     for child in folders[page * page_size: (page + 1) * page_size]:
         label = f"📁 {child['name'][:32]}"
         rows.append([InlineKeyboardButton(
@@ -666,7 +679,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if text == FILES_BTN:
         ud.pop("renaming", None)
         ud.pop("creating_folder_in", None)
+        ud.pop("searching_files", None)
         await user_files(update, ctx)
+        return
+    if text == RECENT_BTN:
+        ud.pop("searching_files", None)
+        await recent_command(update, ctx)
+        return
+    if text == SEARCH_BTN:
+        await search_command(update, ctx)
         return
     if text == NEW_FOLDER_BTN:
         if not await _private_ui(update):
@@ -684,6 +705,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if text == HELP_BTN:
         await help_command(update, ctx)
+        return
+
+    if ud.pop("searching_files", False):
+        try:
+            await _show_file_results(update, ctx, text)
+        except ValueError as exc:
+            ud["searching_files"] = True
+            await update.message.reply_text(str(exc))
         return
 
     if ud.get("creating_folder_in"):
@@ -724,7 +753,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if x["id"] == fid:
                 x["name"] = renamed["name"]
         await update.message.reply_text(
-            f"تغيّر الاسم لـ «{renamed['name']}».", reply_markup=_menu_keyboard(person.id),
+            f"تغيّر الاسم لـ «{renamed['name']}».\n"
+            f"رابطه: {drive_file_url(fid)}",
+            reply_markup=kb_after_upload(fid),
         )
         await ask_next(ctx, chat_id, ud)
         return
@@ -782,7 +813,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- per-user browser ----------
 def _menu_keyboard(uid=None):
-    rows = [[FILES_BTN, NEW_FOLDER_BTN], [UPLOAD_BTN, STATUS_BTN], [HELP_BTN]]
+    rows = [[FILES_BTN, RECENT_BTN], [SEARCH_BTN, NEW_FOLDER_BTN],
+            [UPLOAD_BTN, STATUS_BTN], [HELP_BTN]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 async def _drive_call(fn, *args):
@@ -798,6 +830,7 @@ async def _private_ui(update):
 
 
 def _browser_snapshot(uid, display, folder_id):
+    USER_DRIVE.ensure_defaults(uid, display)
     root = USER_DRIVE.ensure_root(uid, display)
     folder = USER_DRIVE.require_folder(uid, folder_id or root["id"], display)
     active = USER_DRIVE.current(uid, display)
@@ -842,6 +875,8 @@ async def show_browser(update, ctx, folder_id=None, page=0):
         InlineKeyboardButton("✅ خلي الرفع هون", callback_data=f"choose:{folder['id']}"),
         InlineKeyboardButton("➕ مجلد جديد", callback_data=f"add:{folder['id']}"),
     ])
+    rows.append([InlineKeyboardButton("🕘 آخر ملفاتي", callback_data="recent"),
+                 InlineKeyboardButton("🔎 بحث عن ملف", callback_data="findprompt")])
     controls = [InlineKeyboardButton("🔄 تحديث", callback_data=f"nav:{folder['id']}")]
     if folder["id"] != root["id"]:
         parent = (folder.get("parents") or [root["id"]])[0]
@@ -852,11 +887,14 @@ async def show_browser(update, ctx, folder_id=None, page=0):
     else:
         controls.append(InlineKeyboardButton("🏠 مجلدي", callback_data="home"))
     rows.append(controls)
+    folder_count = sum(i.get("mimeType") == FOLDER_MIME for i in items)
+    file_count = len(items) - folder_count
     summary = (
         f"📁 {folder.get('name', 'ملفاتي')}\n"
-        f"📍 مكان الرفع: {current.get('name', '')}\n"
-        f"📚 {len(items)} عنصر" + (" (أول 1000 فقط)" if more else "") + "\n\n" +
-        ("اختار الملف أو المجلد من تحت." if items else "المجلد فاضي، ابعت ملف أو اعمل مجلد جديد.")
+        f"مجلدات: {folder_count}   |   ملفات: {file_count}\n"
+        f"مكان الرفع الحالي: {current.get('name', '')}\n\n" +
+        ("اختار مجلد، أو افتح ملف لتلاقي رابطه." if items else "المجلد فاضي. ابعت ملف أو اعمل مجلد.")
+        + ("\n(في عناصر إضافية ما ظهرت بالقائمة)" if more else "")
     )
     markup = InlineKeyboardMarkup(rows)
     if update.callback_query:
@@ -879,20 +917,68 @@ async def show_item(update, ctx, file_id):
         return
     parent = (meta.get("parents") or [None])[0]
     size = int(meta.get("size") or 0) / (1024 * 1024)
-    text = f"📄 {meta.get('name', 'ملف')}\n📦 الحجم: {size:.1f} MB\n\nشو بدك تعمل؟"
+    link = drive_file_url(meta["id"])
+    text = (
+        f"📄 {meta.get('name', 'ملف')}\n"
+        f"الحجم: {size:.1f} MB\n\n"
+        f"🔗 رابط الملف:\n{link}\n\n"
+        "فيك تضغط على الرابط أو تنسخه بأي وقت."
+    )
     markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔗 فتح على Drive", url=link)],
         [InlineKeyboardButton("✏️ تغيير الاسم", callback_data=f"ren:{file_id}"),
          InlineKeyboardButton("🗑 حذف", callback_data=f"trash:{file_id}")],
         [InlineKeyboardButton("⬅️ رجوع", callback_data=f"nav:{parent}")],
     ])
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=markup)
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=markup)
+        except BadRequest as exc:
+            if "Message is not modified" not in str(exc):
+                raise
     else:
         await update.effective_message.reply_text(text, reply_markup=markup)
 
-
 async def user_files(update, ctx):
     await show_browser(update, ctx)
+
+
+
+async def _show_file_results(update, ctx, phrase=None):
+    if not await _private_ui(update):
+        return
+    person = update.effective_user
+    if phrase is None:
+        found = await _drive_call(USER_DRIVE.recent_files, person.id, person.full_name)
+        title = "🕘 آخر ملفاتك"
+    else:
+        found = await _drive_call(USER_DRIVE.search_files, person.id, person.full_name, phrase)
+        title = f"🔎 نتائج «{phrase[:55]}»"
+    rows = []
+    for meta in found:
+        title_button = _item_button("📄 " + meta.get("name", "ملف")[:35], "item", meta["id"])
+        if title_button:
+            rows.append([
+                title_button,
+                InlineKeyboardButton("🔗", url=drive_file_url(meta["id"])),
+            ])
+    rows.append([InlineKeyboardButton("📁 كل المجلدات", callback_data="home"),
+                 InlineKeyboardButton("🔎 بحث", callback_data="findprompt")])
+    text = (f"{title}\n\n"
+            + ("اضغط على اسم الملف للتفاصيل، أو 🔗 لتفتحه مباشرة."
+               if found else "ما لقيت ملفات بهالاسم. جرّب كلمة تانية."))
+    await update.effective_message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def recent_command(update, ctx):
+    await _show_file_results(update, ctx)
+
+
+async def search_command(update, ctx):
+    if not await _private_ui(update):
+        return
+    ctx.user_data["searching_files"] = True
+    await update.effective_message.reply_text("اكتب جزء من اسم الملف اللي بدك رابطه. حرفين على الأقل.")
 
 
 async def upload_help(update, ctx):
@@ -929,6 +1015,11 @@ async def on_browser_button(update, ctx):
         if action == "home":
             root = await _drive_call(USER_DRIVE.ensure_root, uid, display)
             await show_browser(update, ctx, root["id"])
+        elif action == "recent":
+            await _show_file_results(update, ctx)
+        elif action == "findprompt":
+            ctx.user_data["searching_files"] = True
+            await cq.message.reply_text("اكتب جزء من اسم الملف اللي عم تدور عليه.")
         elif action == "nav":
             await show_browser(update, ctx, arg)
         elif action == "page":
@@ -1216,10 +1307,12 @@ app.add_handler(CommandHandler("status", status))
 app.add_handler(CommandHandler("newfolder", newfolder))
 app.add_handler(CommandHandler("folder", folder))
 app.add_handler(CommandHandler("files", user_files))
+app.add_handler(CommandHandler("recent", recent_command))
+app.add_handler(CommandHandler("find", search_command))
 app.add_handler(CommandHandler("skip", skip))
 app.add_handler(CommandHandler("skipall", skipall))
 app.add_handler(CallbackQueryHandler(on_upload_folder_button, pattern=r"^(upnav:|upset:|uppage:|upadd:)"))
-app.add_handler(CallbackQueryHandler(on_browser_button, pattern=r"^(home$|nav:|page:|item:|choose:|add:|trash:|confirm:|cancel:|skipone$|skipall$)"))
+app.add_handler(CallbackQueryHandler(on_browser_button, pattern=r"^(home$|recent$|findprompt$|nav:|page:|item:|choose:|add:|trash:|confirm:|cancel:|skipone$|skipall$)"))
 app.add_handler(CallbackQueryHandler(on_button, pattern=r"^(status|ren:)"))
 app.add_handler(MessageHandler(filters.Regex(f"^{re.escape(STATUS_BTN)}$"), status))
 app.add_handler(MessageHandler(filters.ATTACHMENT, on_file))
