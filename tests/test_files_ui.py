@@ -8,7 +8,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULES = {
-    "bot.py": {"drive_file_url", "show_item", "_show_file_results", "_menu_keyboard", "_upload_folder_snapshot"},
+    "bot.py": {
+        "drive_file_url", "show_item", "_show_file_results", "_menu_keyboard",
+        "_upload_folder_snapshot", "show_browser", "_show_upload_folders",
+    },
 }
 
 
@@ -105,15 +108,77 @@ class FileExperienceTests(unittest.IsolatedAsyncioTestCase):
             {"id": "d", "name": "file.pdf", "mimeType": "application/pdf"},
         ]
         user_drive = SimpleNamespace(
-            ensure_defaults=MagicMock(), ensure_root=MagicMock(return_value=folder),
-            require_folder=MagicMock(return_value=folder),
+            ensure_defaults=MagicMock(),
+            folder_path=MagicMock(return_value=(folder, folder, ["ملفاتي"])),
             list_children=MagicMock(return_value=(items, False)),
         )
         self.ns["USER_DRIVE"] = user_drive
-        root, selected, folders, more = self.ns["_upload_folder_snapshot"](123, "Student", "root")
+        root, selected, folders, files, more, breadcrumb = (
+            self.ns["_upload_folder_snapshot"](123, "Student", "root")
+        )
         user_drive.ensure_defaults.assert_called_once_with(123, "Student")
         self.assertEqual([x["name"] for x in folders], ["فويسات", "محاضرات", "ملفات عامة"])
+        self.assertEqual([x["name"] for x in files], ["file.pdf"])
+        self.assertEqual(breadcrumb, ["ملفاتي"])
         self.assertFalse(more)
+
+    async def test_open_folder_replaces_message_with_contents_and_breadcrumb(self):
+        root = {"id": "root", "name": "ملفاتي"}
+        folder = {"id": "sub", "name": "المحاضرة الأولى", "parents": ["root"]}
+        contents = [
+            {"id": "nested", "name": "التمارين", "mimeType": "application/vnd.google-apps.folder"},
+            {"id": "pdf_1", "name": "الملزمة.pdf", "mimeType": "application/pdf"},
+        ]
+        self.ns["_private_ui"] = AsyncMock(return_value=True)
+        self.ns["_drive_call"] = AsyncMock(return_value=(
+            root, folder, {"name": folder["name"]}, contents, False,
+            ["ملفاتي", "محاضرات", "المحاضرة الأولى"],
+        ))
+        self.ns["_item_button"] = lambda text, action, ident: Button(
+            text, callback_data=f"{action}:{ident}"
+        )
+        self.ns["BadRequest"] = Exception
+        query = SimpleNamespace(edit_message_text=AsyncMock())
+        update = SimpleNamespace(
+            callback_query=query, effective_user=SimpleNamespace(id=123, full_name="Student"),
+            effective_message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        await self.ns["show_browser"](update, None, "sub")
+        args, kwargs = query.edit_message_text.await_args
+        self.assertIn("ملفاتي / محاضرات / المحاضرة الأولى", args[0])
+        self.assertIn("2", args[0])  # Both entries appear inside this folder
+        rows = kwargs["reply_markup"].rows
+        self.assertEqual(rows[0][0].callback_data, "nav:root")
+        self.assertEqual(rows[0][1].callback_data, "home")
+        self.assertTrue(any(x.callback_data == "nav:nested" for row in rows for x in row))
+        self.assertTrue(any(x.url == "https://drive.google.com/file/d/pdf_1/view"
+                            for row in rows for x in row))
+        update.effective_message.reply_text.assert_not_awaited()
+
+    async def test_upload_picker_opens_nested_folder_and_shows_existing_files(self):
+        root = {"id": "root", "name": "ملفاتي"}
+        folder = {"id": "sub", "name": "محاضرات", "parents": ["root"]}
+        folder_item = {"id": "subsub", "name": "نظم منطقية"}
+        file_item = {"id": "existing_pdf", "name": "المحاضرة 5.pdf"}
+        self.ns["_drive_call"] = AsyncMock(return_value=(
+            root, folder, [folder_item], [file_item], False,
+            ["ملفاتي", "محاضرات"],
+        ))
+        self.ns["BadRequest"] = Exception
+        cq = SimpleNamespace(edit_message_text=AsyncMock())
+        ctx = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+        item = {"token": "42", "label": "فويس.ogg", "uid": 123, "owner_name": "Student"}
+        await self.ns["_show_upload_folders"](ctx, 77, item, folder_id="sub", cq=cq)
+        text, kwargs = cq.edit_message_text.await_args
+        self.assertIn("ملفاتي / محاضرات", text[0])
+        self.assertIn("مجلدات: 1", text[0])
+        self.assertIn("ملفات: 1", text[0])
+        rows = kwargs["reply_markup"].rows
+        self.assertTrue(any(x.callback_data == "upnav:42:subsub" for row in rows for x in row))
+        self.assertTrue(any(x.callback_data == "upset:42:subsub" for row in rows for x in row))
+        self.assertTrue(any(x.url == "https://drive.google.com/file/d/existing_pdf/view"
+                            for row in rows for x in row))
+        ctx.bot.send_message.assert_not_awaited()
 
 
 if __name__ == "__main__":
