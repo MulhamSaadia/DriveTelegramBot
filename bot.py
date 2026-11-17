@@ -47,6 +47,8 @@ FILES_BTN = "📁 ملفاتي"
 NEW_FOLDER_BTN = "➕ مجلد جديد"
 UPLOAD_BTN = "📤 رفع ملف"
 HELP_BTN = "❓ طريقة الاستخدام"
+RECENT_BTN = "🕘 آخر ملفاتي"
+SEARCH_BTN = "🔎 بحث عن ملف"
 # Optional: URL of a self-hosted Telegram Bot API server (run with --local) -> files up to 2GB.
 # Without it, Telegram's cloud Bot API limits downloads to 20MB.
 BOT_API_URL = os.environ.get("BOT_API_URL", "").rstrip("/")
@@ -69,9 +71,20 @@ def q(sql, args=(), fetch=None):
         conn.close()
 
 
+# Most folder operations read the same settings repeatedly. Small TTL = fewer
+# cross-region Postgres connections while still noticing external changes.
+_SETTINGS_CACHE = {}
+
+
 def get_setting(key, default=None):
+    now = time.monotonic()
+    cached = _SETTINGS_CACHE.get(key)
+    if cached and cached[0] > now:
+        return cached[1] if cached[1] is not None else default
     r = q("select value from drivebot.settings where key=%s", (key,), "one")
-    return r["value"] if r else default
+    value = r["value"] if r else None
+    _SETTINGS_CACHE[key] = (now + 45, value)
+    return value if value is not None else default
 
 
 def set_setting(key, value):
@@ -80,6 +93,7 @@ def set_setting(key, value):
         "on conflict (key) do update set value = excluded.value",
         (key, value),
     )
+    _SETTINGS_CACHE[key] = (time.monotonic() + 45, value)
 
 
 def touch_user(u, default_status):
@@ -92,8 +106,13 @@ def touch_user(u, default_status):
     )
 
 
+_USER_GATE_CACHE = {}
+
+
 def set_status(uid, status):
-    return q("update drivebot.users set status=%s where id=%s returning *", (status, int(uid)), "one")
+    result = q("update drivebot.users set status=%s where id=%s returning *", (status, int(uid)), "one")
+    _USER_GATE_CACHE.pop(int(uid), None)
+    return result
 
 
 def inc_uploads(uid):
@@ -294,10 +313,19 @@ async def _finish_queued_file(ctx, chat_id, user_data, chosen_name):
     queue = user_data.get("queue", [])
     if not queue or not queue[0].get("target_folder"):
         return False
-    if await upload_item(ctx, chat_id, user_data, queue[0], chosen_name):
-        queue.pop(0)
-        return True
-    return False
+    item = queue[0]
+    if item.get("_uploading"):
+        return False
+    item["_uploading"] = True
+    try:
+        done = await upload_item(ctx, chat_id, user_data, item, chosen_name)
+        if done:
+            if queue and queue[0] is item:
+                queue.pop(0)
+            return True
+        return False
+    finally:
+        item.pop("_uploading", None)
 
 
 async def on_upload_folder_button(update, ctx):
@@ -984,18 +1012,24 @@ async def gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not u or u.id in ADMIN_IDS:
         return
-    default = "pending" if get_setting("approval_mode", "false") == "true" else "active"
-    rec = touch_user(u, default)
-    if rec["is_new"]:
-        for aid in ADMIN_IDS:
-            status_label = {"pending": "بانتظار الموافقة", "active": "مفعّل", "banned": "محظور"}.get(rec["status"], rec["status"])
-            await ctx.bot.send_message(
-                aid, f"مستخدم جديد: {label(rec)} ({u.id})\nالحالة: {status_label}",
-                reply_markup=InlineKeyboardMarkup([[user_button(rec)]]),
-            )
-    if rec["status"] == "banned":
+    cached = _USER_GATE_CACHE.get(u.id)
+    if cached and time.monotonic() - cached[0] < 12:
+        status = cached[1]
+    else:
+        default = "pending" if get_setting("approval_mode", "false") == "true" else "active"
+        rec = await asyncio.to_thread(touch_user, u, default)
+        status = rec["status"]
+        _USER_GATE_CACHE[u.id] = (time.monotonic(), status)
+        if rec["is_new"]:
+            for aid in ADMIN_IDS:
+                status_label = {"pending": "بانتظار الموافقة", "active": "مفعّل", "banned": "محظور"}.get(status, status)
+                await ctx.bot.send_message(
+                    aid, f"مستخدم جديد: {label(rec)} ({u.id})\nالحالة: {status_label}",
+                    reply_markup=InlineKeyboardMarkup([[user_button(rec)]]),
+                )
+    if status == "banned":
         raise ApplicationHandlerStop
-    if rec["status"] == "pending":
+    if status == "pending":
         if update.effective_chat:
             await ctx.bot.send_message(update.effective_chat.id, "طلبك ناطر موافقة الإدارة.")
         raise ApplicationHandlerStop
@@ -1166,7 +1200,7 @@ def start_health_server():
 
 start_health_server()
 
-builder = ApplicationBuilder().token(BOT_TOKEN)
+builder = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(3)
 if BOT_API_URL:
     builder = builder.base_url(f"{BOT_API_URL}/bot").base_file_url(f"{BOT_API_URL}/file/bot").local_mode(True)
 app = builder.build()
