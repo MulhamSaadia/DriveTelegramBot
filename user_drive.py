@@ -86,22 +86,31 @@ class UserDrive:
         self.set_setting(self._key(uid, "root"), meta["id"])
         return meta
 
-    def require_folder(self, uid, folder_id, display_name):
+    def folder_path(self, uid, folder_id, display_name):
+        """Validate the whole folder ancestry and return root, folder, breadcrumb."""
         root = self.ensure_root(uid, display_name)
         if not folder_id:
             raise FolderAccessError("ما في مجلد محدد.")
         visited = set()
         current = folder_id
+        leaf = None
+        names = []
         while current and current not in visited and len(visited) < 30:
             visited.add(current)
             meta = self._get(current)
             if not self._owned(meta, uid) or meta.get("mimeType") != FOLDER_MIME:
                 raise FolderAccessError("ما عندك صلاحية لهالمجلد.")
+            if leaf is None:
+                leaf = meta
             if current == root["id"]:
-                return self._get(folder_id)
+                return root, leaf, ["ملفاتي"] + list(reversed(names))
+            names.append(meta.get("name", "مجلد"))
             parents = meta.get("parents") or []
             current = parents[0] if parents else None
         raise FolderAccessError("المجلد مو ضمن ملفاتك.")
+
+    def require_folder(self, uid, folder_id, display_name):
+        return self.folder_path(uid, folder_id, display_name)[1]
 
     def require_item(self, uid, item_id, display_name):
         meta = self._get(item_id)
