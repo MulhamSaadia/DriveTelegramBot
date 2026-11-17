@@ -1,6 +1,11 @@
 #!/bin/sh
 # Runs a local Telegram Bot API server (files up to 2GB) + the bot in one container.
 set -e
+
+# Frankfurt staging can build and pass /health without polling Telegram.
+if [ "${BOT_STANDBY:-0}" = "1" ]; then
+  exec python standby.py
+fi
 telegram-bot-api --api-id="$TELEGRAM_API_ID" --api-hash="$TELEGRAM_API_HASH" \
   --local --dir=/data --http-port=8081 &
 
