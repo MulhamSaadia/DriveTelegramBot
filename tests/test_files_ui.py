@@ -146,7 +146,8 @@ class FileExperienceTests(unittest.IsolatedAsyncioTestCase):
         await self.ns["show_browser"](update, None, "sub")
         args, kwargs = query.edit_message_text.await_args
         self.assertIn("ملفاتي / محاضرات / المحاضرة الأولى", args[0])
-        self.assertIn("2", args[0])  # Both entries appear inside this folder
+        self.assertIn("1 مجلدات", args[0])
+        self.assertIn("1 ملفات", args[0])
         rows = kwargs["reply_markup"].rows
         self.assertEqual(rows[0][0].callback_data, "nav:root")
         self.assertEqual(rows[0][1].callback_data, "home")
